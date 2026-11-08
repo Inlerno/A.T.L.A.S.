@@ -18,7 +18,8 @@ secrets/
 *.db
 *.db-shm
 *.db-wal
-.vscode/
+.vscode/*
+!.vscode/extensions.json
 .idea/
 .DS_Store
 Thumbs.db
@@ -28,3 +29,7 @@ coverage/
 *.msi
 *.exe
 *.nsis.zip
+
+# Frontend build / local env
+dist-ssr/
+*.local

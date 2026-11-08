@@ -4,7 +4,7 @@
 Create a clean, reproducible Windows desktop foundation. Do not implement all product features at once.
 
 ## Stage 0 — GitHub and Tauri scaffold
-1. Create GitHub repository `local-ai-assistant` (private initially).
+1. GitHub repository: `Inlerno/A.T.L.A.S.` (product name ATLAS). On Windows clone into a short ASCII path outside OneDrive with an explicit folder name, because the repository name ends with a dot: `git clone https://github.com/Inlerno/A.T.L.A.S..git C:\dev\atlas`.
 2. Extract this package into repository root and commit.
 3. Install Git for Windows, Node.js LTS, Rust stable and Tauri 2 Windows prerequisites (C++ Build Tools and WebView2 as required).
 4. Generate the official Tauri 2 React + TypeScript + Vite starter. If generator requires an empty directory, generate in a temporary sibling directory and copy scaffold files without overwriting docs.
@@ -34,6 +34,7 @@ Out of scope: microphone, real LLM calls, Telegram, Windows automation, long-ter
 - [ ] Structured errors/logging do not leak secrets.
 - [ ] No credentials or machine-specific paths committed.
 - [ ] `cargo fmt --check` passes.
+- [ ] `cargo clippy --all-targets -- -D warnings` passes.
 - [ ] `cargo test` passes.
 - [ ] Frontend typecheck/build pass using actual package scripts.
 - [ ] Manual Windows checks and environment versions documented.
