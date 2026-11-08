@@ -6,6 +6,7 @@ Closes #
 - [ ] No unrelated refactoring
 ## Verification
 - [ ] `cargo fmt --check`
+- [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`
 - [ ] Frontend typecheck/build using actual scripts
 - [ ] Manual Windows verification described

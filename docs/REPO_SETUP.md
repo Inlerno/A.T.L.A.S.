@@ -1,6 +1,6 @@
 # GitHub repository setup
 
-1. Create `local-ai-assistant` on GitHub; private initially.
+1. Repository: `Inlerno/A.T.L.A.S.` (product name ATLAS). Clone on Windows with an explicit folder name: `git clone https://github.com/Inlerno/A.T.L.A.S..git C:\dev\atlas` (a trailing dot in a folder name is stripped by Windows).
 2. Do not auto-generate README or .gitignore; this package contains them. Choose a license deliberately after dependency/license review.
 3. Extract package contents to repository root; ensure `CLAUDE.md` is at root.
 4. Commit the documentation baseline.
