@@ -4,7 +4,7 @@
 Create a clean, reproducible Windows desktop foundation. Do not implement all product features at once.
 
 ## Stage 0 — GitHub and Tauri scaffold
-1. GitHub repository: `Inlerno/A.T.L.A.S.` (product name ATLAS). On Windows clone into a short ASCII path outside OneDrive with an explicit folder name, because the repository name ends with a dot: `git clone https://github.com/Inlerno/A.T.L.A.S..git C:\dev\atlas`.
+1. GitHub repository: `Inlerno/ATLAS` (renamed from `Inlerno/A.T.L.A.S.` on 2026-11-09: the trailing dot broke Windows paths, including the GitHub Actions runner workspace). On Windows clone into a short ASCII path outside OneDrive: `git clone https://github.com/Inlerno/ATLAS.git C:\dev\atlas`.
 2. Extract this package into repository root and commit.
 3. Install Git for Windows, Node.js LTS, Rust stable and Tauri 2 Windows prerequisites (C++ Build Tools and WebView2 as required).
 4. Generate the official Tauri 2 React + TypeScript + Vite starter. If generator requires an empty directory, generate in a temporary sibling directory and copy scaffold files without overwriting docs.
