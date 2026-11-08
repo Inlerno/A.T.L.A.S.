@@ -1,16 +1,16 @@
-# Ready prompts for Claude Chat
+# Ready prompts for Claude
 
 ## First repository review
-Read `CLAUDE.md`, `README.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md` and `docs/FIRST_STAGE.md` from the connected GitHub repository. Do not write code yet. Summarize confirmed requirements, architecture boundaries, contradictions, Windows risks and the smallest first issue. Remember this is Claude Chat + GitHub context, not a coding agent with terminal/write access.
+Read `CLAUDE.md`, `README.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md` and `docs/FIRST_STAGE.md` from the repository. Do not write code yet. Summarize confirmed requirements, architecture boundaries, contradictions, Windows risks and the smallest first issue. Claude has direct write access (branches, commits, PRs) but must not change anything until the plan is approved.
 
 ## Plan one issue
 For issue #[NUMBER], inspect relevant current files. Return understanding, acceptance criteria, plan, files to change, dependencies/risks and exact PowerShell verification commands. Do not code until plan is approved. Do not expand scope.
 
 ## Draft implementation
-Implement the approved plan for issue #[NUMBER]. Return complete contents for every new/changed file or precise unified diff, with repository-relative paths. Include tests and commands. Do not claim tests passed.
+Implement the approved plan for issue #[NUMBER]: branch from current `main` (`<type>/<issue>-short-name`), Conventional Commits, open a PR with `Closes #[NUMBER]`. Report checks actually run and where (cloud Linux vs Windows), list what still needs Windows verification. Do not merge.
 
-## Review local diff
-I will paste `git diff` and command output. Review correctness, Rust ownership/concurrency, frontend typing/IPC, security/secrets, Windows issues and scope creep. Classify Critical/High/Medium/Low and provide precise fixes.
+## Review PR
+Review PR #[NUMBER] on GitHub: correctness, Rust ownership/concurrency, frontend typing/IPC, security/secrets, Windows issues and scope creep. Classify Critical/High/Medium/Low, give precise fixes (GitHub suggestions where possible). Do not approve or merge.
 
 ## Debug
 I will provide exact command, full error output and relevant files. Identify the first causal error. Give a minimal patch and verification command. Ask for missing diagnostics rather than guessing.

@@ -46,7 +46,7 @@ cargo test
 - `CLAUDE.md` — проектные инструкции Claude.
 - `docs/ARCHITECTURE.md` — архитектура.
 - `docs/ROADMAP.md` — этапы.
-- `docs/DEVELOPMENT_WORKFLOW.md` — процесс Claude Chat + GitHub.
+- `docs/DEVELOPMENT_WORKFLOW.md` — процесс разработки с Claude (прямой доступ к репозиторию, PR, проверка на Windows).
 - `docs/FIRST_STAGE.md` — первый этап.
 - `docs/CLAUDE_CHAT_PROMPTS.md` — готовые запросы.
 - `docs/DEVELOPMENT_LOG.md` — версии окружения и журнал проверок.

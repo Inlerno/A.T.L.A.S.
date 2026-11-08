@@ -4,10 +4,9 @@
 2. Do not auto-generate README or .gitignore; this package contains them. Choose a license deliberately after dependency/license review.
 3. Extract package contents to repository root; ensure `CLAUDE.md` is at root.
 4. Commit the documentation baseline.
-5. Connect GitHub in Claude settings; grant access only to this repository if possible.
-6. Create a Claude Project and add the repository to Project Knowledge.
-7. Select `CLAUDE.md`, `README.md`, and key docs under `docs/`; sync after meaningful pushes.
-8. Copy the core rules from `CLAUDE.md` into Project Instructions if supported. The version-controlled file remains the source of truth.
+5. Give Claude access to this repository only (session repository attachment). Claude works per ADR-010: branches, commits, issues and PRs; the user merges.
+6. Optional: a Claude Project for plans and audits; the repository remains the source of truth.
+7. Keep `CLAUDE.md` as the single source of project rules.
 
 Suggested labels: `stage:foundation`, `type:feature`, `type:bug`, `type:chore`, `type:docs`, `priority:high`, `priority:medium`, `priority:low`, `needs-decision`.
 
