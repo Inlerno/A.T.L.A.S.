@@ -1,7 +1,7 @@
 # Ready prompts for Claude Chat
 
 ## First repository review
-Read `CLAUDE.md`, `README.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md` and `docs/FIRST_STAGE.md` from the connected GitHub repository. Do not write code yet. Summarize confirmed requirements, architecture boundaries, contradictions, Windows risks and the smallest first issue. Remember this is Claude Chat + GitHub context, not a coding agent with terminal/write access.
+Read `CLAUDE.md`, `README.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md` and `docs/FIRST_STAGE.md` from the connected GitHub repository. Do not write code yet. Summarize confirmed requirements, architecture boundaries, contradictions, Windows risks and the smallest first issue. Claude has direct write access (branches, commits, PRs) but must not change anything until the plan is approved.
 
 ## Plan one issue
 For issue #[NUMBER], inspect relevant current files. Return understanding, acceptance criteria, plan, files to change, dependencies/risks and exact PowerShell verification commands. Do not code until plan is approved. Do not expand scope.

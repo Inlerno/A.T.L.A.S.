@@ -1,35 +1,44 @@
-# Development workflow — Claude Chat + GitHub
+# Development workflow — Claude с прямым доступом к репозиторию
 
-## Connector limitation
-Claude's GitHub integration syncs selected file names and contents from a repository branch. It is repository context, not a normal local filesystem/terminal/Git client. Do not assume Claude Chat can apply edits, run builds, create commits or open PRs.
+См. ADR-010 в `docs/DECISIONS.md`.
 
-Use Claude for architecture, code review, debugging, plans and complete file contents/diffs. Apply, test and publish changes locally.
+## Роли
+| Кто | Что делает |
+|---|---|
+| Claude | Анализ, план, issue, ветка, код, тесты, проверки в облачном Linux, PR с описанием проверок |
+| Пользователь | Согласует план, проверяет на Windows, делает ревью, **сливает PR** |
 
-## Loop
-1. Create a narrow GitHub issue with acceptance criteria.
-2. In Claude Project, sync relevant repository files.
-3. Ask Claude to inspect and plan before drafting.
-4. Request full file contents or precise unified diff with exact paths.
-5. Apply locally in VS Code or another editor.
-6. Run checks and paste exact output into Claude if they fail.
-7. Review `git diff`; don't commit secrets or build output.
-8. Commit and push locally.
-9. Sync GitHub context before next task.
+Облачное окружение Claude — Linux. Сборка, `cargo test`, `clippy`, `npm run build` там подтверждают компиляцию и логику, но не поведение на Windows (WebView2, MSVC, пути, микрофон, Credential Manager и т. п.).
 
-## Branches
-- `main`: buildable baseline.
-- `feature/<issue>-short-name`: one issue per branch.
-- Merge after local checks and manual review.
+## Цикл задачи
+1. Пользователь формулирует задачу.
+2. Claude изучает репозиторий и документацию, предлагает план: архитектура, файлы, этапы, acceptance criteria, риски. **Код не пишется до согласования.**
+3. Claude создаёт issue с согласованным планом.
+4. Claude создаёт ветку от актуального `main` (или от ветки незаслитого зависимого PR — с пометкой в PR).
+5. Claude реализует, запускает проверки, коммитит и открывает PR с `Closes #N`, описанием проверок и списком того, что нужно проверить на Windows.
+6. Пользователь проверяет на Windows:
+   ```powershell
+   cd C:\dev\atlas
+   git fetch origin
+   git switch <branch>
+   npm ci
+   npm run build
+   npm run tauri dev
+   cd src-tauri
+   cargo fmt --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test
+   ```
+7. При ошибках пользователь присылает команду и полный вывод; Claude исправляет в той же ветке.
+8. Пользователь сливает PR. Claude перед следующей задачей синхронизируется с `main`.
 
-## Git commands
-```powershell
-git status
-git switch -c feature/1-tauri-foundation
-git diff --check
-git diff
-git add <specific-files>
-git commit -m "chore: initialize Tauri foundation"
-git push -u origin feature/1-tauri-foundation
-```
+## Ветки
+- `main`: собираемая база; прямые коммиты запрещены.
+- `<type>/<issue>-short-name`, где type ∈ `feature`, `fix`, `docs`, `chore`.
+- Один issue — одна ветка — один PR.
+
+## Ограничения Claude
+- Не сливает PR, не делает force push в общие ветки, не меняет настройки репозитория, не удаляет ветки без просьбы.
+- Не утверждает, что что-то работает на Windows, без подтверждения пользователя.
 
 Human review is mandatory for dependencies/licenses, migrations, OS-control features, permissions/secrets, installer scripts and destructive operations.
