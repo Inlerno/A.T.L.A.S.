@@ -22,7 +22,7 @@
 6. Python не является обязательным runtime конечного продукта.
 
 ## Быстрый старт (Windows)
-Требования: Git for Windows, Node.js LTS, Rust stable (`x86_64-pc-windows-msvc`), Microsoft C++ Build Tools, WebView2 Runtime — см. официальные Tauri 2 prerequisites.
+Требования: Git for Windows, Node.js `^20.19.0` или `>=22.12.0` (требование Vite 8; рекомендуется актуальный LTS), Rust stable **1.90+** (`x86_64-pc-windows-msvc`), Microsoft C++ Build Tools, WebView2 Runtime — см. официальные Tauri 2 prerequisites.
 
 ```powershell
 git clone https://github.com/Inlerno/A.T.L.A.S..git C:\dev\atlas   # явное имя папки: Windows отбрасывает точку в конце
