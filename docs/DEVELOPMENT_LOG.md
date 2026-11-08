@@ -4,6 +4,46 @@
 
 ---
 
+## 2026-11-09 — Issue #5: Windows CI
+
+Workflow: `.github/workflows/ci.yml`, job `windows` на `windows-latest`, `timeout-minutes: 45`, `permissions: contents: read`.
+
+Триггеры:
+- `push` в `main` и в `chore/5-windows-ci` (гарантирует первый запуск, даже если в базовой ветке PR ещё нет workflow);
+- `pull_request`.
+
+| Action | Версия | SHA | Лицензия |
+|---|---|---|---|
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | MIT |
+| `actions/setup-node` | v7.1.0 | `949feb2413d6458794dcd2491c4babbbce0c15c1` | MIT |
+| `actions/cache` | v6.1.0 | `55cc8345863c7cc4c66a329aec7e433d2d1c52a9` | MIT |
+
+Версии взяты из тегов репозиториев actions (`git ls-remote`); SHA проверены как коммиты с `action.yml` (`runs.using: node24`). Сторонние actions не используются; Rust ставится через предустановленный `rustup`.
+
+Шаги: `npm ci` → `npm run build` → `cargo fmt --check` → `cargo clippy --locked --all-targets -- -D warnings` → `cargo test --locked`.
+
+Проверка в облачном Linux: `actionlint` — OK.
+
+### Результаты прогонов (GitHub Actions, `windows-latest`)
+На каждый push в `chore/5-windows-ci` запускаются два прогона: по `push` и по `pull_request` (PR #14).
+
+| Коммит | Что проверялось | Результат | Время | Прогоны |
+|---|---|---|---|---|
+| `cacf089` | первый запуск (репозиторий ещё `Inlerno/A.T.L.A.S.`) | ❌ job не стартовал: `Directory 'D:\a\A.T.L.A.S.\A.T.L.A.S.' does not exist` | 4 с / 6 с | [42530799004](https://github.com/Inlerno/ATLAS/actions/runs/42530799004/job/128884320728) + PR-прогон |
+| `9d5f205` | после переименования в `Inlerno/ATLAS`; холодный кэш | ✅ success | 5:01 / 4:26 | [42532858253](https://github.com/Inlerno/ATLAS/actions/runs/42532858253/job/128890704475), [42532861682](https://github.com/Inlerno/ATLAS/actions/runs/42532861682/job/128890715471) |
+| `e9f321c` | временное нарушение `rustfmt` | ❌ failure (ожидаемо), `exit code 1` | 0:49 / 0:50 | [42533321819](https://github.com/Inlerno/ATLAS/actions/runs/42533321819/job/128892096671), [42533326255](https://github.com/Inlerno/ATLAS/actions/runs/42533326255/job/128892110083) |
+| `904c900` | revert нарушения; тёплый кэш | ✅ success | 1:36 / 1:43 | [42533441876](https://github.com/Inlerno/ATLAS/actions/runs/42533441876/job/128892450110), [42533447296](https://github.com/Inlerno/ATLAS/actions/runs/42533447296/job/128892465759) |
+
+Выводы:
+- Проверяемые коммиты содержат head PR #2 (`85f81e6`) целиком и меняют поверх него только файлы CI и документации (GitHub compare API), то есть **код PR #2 собран, проверен `clippy` и протестирован на Windows**.
+- `cargo fmt --check` на Windows-раннере проходит: `.gitattributes` с `eol=lf` работает.
+- Кэш ускоряет прогон примерно в 3 раза (≈5 мин → ≈1,5 мин).
+- Причина первого сбоя — точка в конце имени репозитория. Репозиторий переименован пользователем в `Inlerno/ATLAS` (2026-11-09).
+
+Ограничение: логи шагов Actions недоступны Claude (API Actions закрыт прокси сессии); видны только итог, время и аннотации. Шаг, на котором упал прогон `e9f321c`, определён по содержанию изменения и времени (до компиляции Rust дело не дошло), а не по логу.
+
+---
+
 ## 2026-11-08 — Issue #1: Tauri 2 + React + TypeScript scaffold
 
 ### Решения
@@ -76,6 +116,9 @@ npm create tauri-app@latest -- atlas --manager npm --template react-ts --identif
 > 2. запуск окна и все пункты ниже — на реальной Windows-машине, когда появится доступ.
 >
 > До выполнения обоих этапов нельзя утверждать, что приложение собирается и работает на Windows. После каждого этапа этот статус обновляется.
+>
+> **Этап 1 — выполнен (2026-11-09):** Windows CI на `windows-latest` собрал фронтенд, прошёл `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` и `cargo test --locked` на коде PR #2 — прогоны на `9d5f205` и `904c900` (см. запись Issue #5 выше).
+> **Этап 2 — отложен:** запуск окна и пункты ниже на реальной Windows-машине.
 
 - [ ] Windows: редакция / версия / сборка:
 - [ ] `git --version`:

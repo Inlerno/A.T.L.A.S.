@@ -5,6 +5,7 @@ Closes #
 - [ ] Only intended issue
 - [ ] No unrelated refactoring
 ## Verification
+- [ ] CI green (Windows, `.github/workflows/ci.yml`)
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`

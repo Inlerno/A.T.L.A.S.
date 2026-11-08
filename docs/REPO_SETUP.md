@@ -1,6 +1,6 @@
 # GitHub repository setup
 
-1. Repository: `Inlerno/A.T.L.A.S.` (product name ATLAS). Clone on Windows with an explicit folder name: `git clone https://github.com/Inlerno/A.T.L.A.S..git C:\dev\atlas` (a trailing dot in a folder name is stripped by Windows).
+1. Repository: `Inlerno/ATLAS` (product name ATLAS). Do not use a trailing dot in the repository name: Windows strips it from folder names and the GitHub Actions Windows runner cannot create its workspace (the former name `Inlerno/A.T.L.A.S.` failed this way). Clone on Windows into a short ASCII path: `git clone https://github.com/Inlerno/ATLAS.git C:\dev\atlas`.
 2. Do not auto-generate README or .gitignore; this package contains them. Choose a license deliberately after dependency/license review.
 3. Extract package contents to repository root; ensure `CLAUDE.md` is at root.
 4. Commit the documentation baseline.
