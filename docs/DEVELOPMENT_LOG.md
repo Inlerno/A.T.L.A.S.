@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-11-09 — Issue #5: Windows CI
+
+Workflow: `.github/workflows/ci.yml`, job `windows` на `windows-latest`, `timeout-minutes: 45`, `permissions: contents: read`.
+
+Триггеры:
+- `push` в `main` и в `chore/5-windows-ci` (гарантирует первый запуск, даже если в базовой ветке PR ещё нет workflow);
+- `pull_request`.
+
+| Action | Версия | SHA | Лицензия |
+|---|---|---|---|
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | MIT |
+| `actions/setup-node` | v7.1.0 | `949feb2413d6458794dcd2491c4babbbce0c15c1` | MIT |
+| `actions/cache` | v6.1.0 | `55cc8345863c7cc4c66a329aec7e433d2d1c52a9` | MIT |
+
+Версии взяты из тегов репозиториев actions (`git ls-remote`); SHA проверены как коммиты с `action.yml` (`runs.using: node24`). Сторонние actions не используются; Rust ставится через предустановленный `rustup`.
+
+Шаги: `npm ci` → `npm run build` → `cargo fmt --check` → `cargo clippy --locked --all-targets -- -D warnings` → `cargo test --locked`.
+
+Проверка в облачном Linux: `actionlint` — OK.
+
+Результаты прогонов: см. запись ниже (дополняется после прогонов).
+
+---
+
 ## 2026-11-08 — Issue #1: Tauri 2 + React + TypeScript scaffold
 
 ### Решения
