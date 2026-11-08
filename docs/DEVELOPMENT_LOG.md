@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-11-09 — Issue #6: ядро — модель ошибок, логирование, состояние приложения
+
+### Решения (согласованы пользователем)
+- **Fallback логирования.** Если файловый лог недоступен, приложение пишет только в stdout с предупреждением и продолжает работать. Сбой файлового логирования не останавливает приложение; `setup` никогда не возвращает ошибку (иначе Tauri паникует).
+- **Ротация.** Новый файл раз в сутки, хранятся последние **7** файлов (`MAX_LOG_FILES`, включая текущий); старые удаляются автоматически.
+  - Удаление выполняет `tracing-appender` 0.2.5: при создании appender'а (старт приложения) и при каждой смене дня. Удаляются только обычные файлы с префиксом `atlas` и суффиксом `log`, самые старые по времени создания.
+  - Это не только заявлено: тест `rolling_appender_keeps_at_most_max_log_files` (10 старых файлов → ровно 7, посторонние файлы не тронуты) **падает**, если убрать `.max_log_files(...)` (проверено мутацией: `left: 11, right: 7`).
+- **Путь к логам на Windows:** `%LOCALAPPDATA%\com.inlerno.atlas\logs\atlas.YYYY-MM-DD.log`. Дата в имени и момент ротации — по **UTC** (`tracing-appender`), для Калининграда это 02:00.
+- **Сброс буфера при выходе.** `tauri::App::run` завершает процесс через `std::process::exit`, деструкторы управляемого состояния не вызываются. Поэтому guard логов хранится в `AppState` и явно сбрасывается в `flush_logs()` на `RunEvent::Exit`. `flush_logs()` идемпотентен, переживает отравленный мьютекс и одновременные вызовы.
+- **Фильтр уровня:** `RUST_LOG`, иначе `info`. Значение передаётся в чистую функцию; тесты не меняют окружение процесса (`std::env::set_var` — `unsafe` в Rust 2024).
+- Сообщения крейта `log` (в том числе от Tauri) перенаправляются в `tracing` (feature `tracing-log`).
+- Panic hook пишет панику в лог (`target: panic`) и вызывает предыдущий hook — стандартное поведение сохраняется.
+
+### Зависимости
+Прямые (features объявлены явно):
+
+| Крейт | Версия | Лицензия |
+|---|---|---|
+| `thiserror` (`std`) | 2.0.21 | MIT OR Apache-2.0 |
+| `tracing` (`std`) | 0.1.44 | MIT |
+| `tracing-subscriber` (`std`, `registry`, `fmt`, `ansi`, `env-filter`, `tracing-log`) | 0.3.23 | MIT |
+| `tracing-appender` | 0.2.5 | MIT |
+
+Новые транзитивные пакеты в `Cargo.lock` (только добавления, версии существующих не менялись): `lazy_static` 1.5.1, `matchers` 0.2.0, `nu-ansi-term` 0.50.3, `sharded-slab` 0.1.7, `symlink` 0.1.0, `thread_local` 1.1.10, `tracing-attributes` 0.1.31, `tracing-log` 0.2.0, `valuable` 0.1.1 — все MIT или MIT/Apache-2.0.
+
+### Проверки в облачном Linux
+| Проверка | Результат |
+|---|---|
+| `cargo fmt --check` | OK |
+| `cargo clippy --locked --all-targets -- -D warnings` | OK, без `allow(dead_code)` |
+| `cargo test --locked` | 14 тестов OK: 11 unit + 3 интеграционных бинарника по одному тесту |
+| `npm run build` | OK |
+
+Изоляция тестов: глобальный panic hook и глобальный подписчик проверяются в отдельных интеграционных бинарниках (`tests/panic_hook.rs`, `tests/logging_init_file.rs`, `tests/logging_init_fallback.rs`). Cargo запускает каждый отдельным процессом, в каждом ровно один тест, поэтому параллельные unit-тесты на них не влияют.
+
+**Smoke-тест бинарника под Xvfb + openbox (Linux, НЕ Windows):** окно ATLAS появилось; закрытие через `wmctrl -c` (`WM_DELETE_WINDOW`, как кнопка закрытия) → код выхода 0. В файле лога все записи: `file logging enabled` → `ATLAS starting` → `exit requested` → `ATLAS exiting`; ANSI-последовательностей нет.
+Наблюдение: окно из конфигурации создаётся раньше, чем выполняется `setup`, поэтому сообщения, появившиеся до `setup`, в файл не попадают.
+
+### Ограничения
+- При принудительном завершении процесса (`taskkill /F`, сбой нативного кода) последние буферизованные записи могут потеряться — `RunEvent::Exit` не наступает.
+- Сообщения, появившиеся до `setup`, в файл не попадают.
+
+### Ручная проверка на Windows — ОТЛОЖЕНА
+> **Статус: ОТЛОЖЕНА** — решение пользователя от 2026-11-09 (нет доступа к Windows-машине; допускается `CLAUDE.md` / ADR-010).
+> Сборка, `clippy` и тесты на Windows выполняет CI (`windows-latest`). Отложены:
+> - [ ] `npm run tauri dev` — окно ATLAS открывается;
+> - [ ] в `%LOCALAPPDATA%\com.inlerno.atlas\logs` создан `atlas.YYYY-MM-DD.log` со строками `file logging enabled` и `ATLAS starting`;
+> - [ ] после закрытия окна в файле есть `exit requested` и `ATLAS exiting`, приложение закрывается без зависания;
+> - [ ] `$env:RUST_LOG="debug"; npm run tauri dev` — в логе появляются записи уровня DEBUG.
+
+---
+
 ## 2026-11-09 — Issue #5: Windows CI
 
 Workflow: `.github/workflows/ci.yml`, job `windows` на `windows-latest`, `timeout-minutes: 45`, `permissions: contents: read`.
