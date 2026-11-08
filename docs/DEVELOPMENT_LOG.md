@@ -69,6 +69,14 @@ npm create tauri-app@latest -- atlas --manager npm --template react-ts --identif
 Повторно после правок по ревью (2026-11-09, та же среда): `npm ci`, `npm run build`, `npm audit` (0), `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` — OK; `npm run tauri info` — раздел Plugins пуст; capability `default` содержит только `core:default` и проходит проверку `tauri-build`. Компиляция под `x86_64-pc-windows-msvc` из облака невозможна (сетевая политика окружения не даёт скачать rust-std для этого таргета) — её закроет CI в #5.
 
 ### Ручная проверка на Windows — заполняет разработчик
+> **Статус: ОТЛОЖЕНА** — решение пользователя от 2026-11-09 (допускается правилами `CLAUDE.md` / ADR-010).
+> Причина: сейчас нет доступа к Windows-машине.
+> Проверка будет выполнена в два этапа:
+> 1. компиляция, линковка и тесты под `x86_64-pc-windows-msvc` — CI на `windows-latest` (#5);
+> 2. запуск окна и все пункты ниже — на реальной Windows-машине, когда появится доступ.
+>
+> До выполнения обоих этапов нельзя утверждать, что приложение собирается и работает на Windows. После каждого этапа этот статус обновляется.
+
 - [ ] Windows: редакция / версия / сборка:
 - [ ] `git --version`:
 - [ ] `node --version` / `npm --version`:
