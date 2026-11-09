@@ -1,7 +1,7 @@
 //! Application core: state and lifecycle glue (issue #6).
 //!
-//! Fields for the event bus (#8) and the module manager (#9) are added in
-//! their own stages.
+//! Holds the central event bus (#8); the module manager (#9) is added in its
+//! own stage.
 
 mod state;
 
