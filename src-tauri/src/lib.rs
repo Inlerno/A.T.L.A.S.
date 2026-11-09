@@ -71,10 +71,15 @@ pub fn run() {
                     let handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = modules.shutdown().await;
-                        if let Some(state) = handle.try_state::<AppState>() {
-                            state.modules_stopped();
+                        // Not if `RunEvent::Exit` has already begun: an exit
+                        // requested then could end the process before the
+                        // logs are flushed.
+                        let exit_again = handle
+                            .try_state::<AppState>()
+                            .is_none_or(|state| state.modules_stopped());
+                        if exit_again {
+                            handle.exit(code.unwrap_or(0));
                         }
-                        handle.exit(code.unwrap_or(0));
                     });
                 }
                 ExitStep::Wait => api.prevent_exit(),
@@ -84,12 +89,11 @@ pub fn run() {
         tauri::RunEvent::Exit => {
             tracing::info!("ATLAS exiting");
             if let Some(state) = app_handle.try_state::<AppState>() {
-                if !state.are_modules_stopped() {
+                if state.begin_exit() {
                     // Exit without a completed stop (e.g. a restart, where the
                     // exit cannot be prevented): stop the modules here, within
                     // the same overall timeout.
                     let _ = tauri::async_runtime::block_on(state.modules().shutdown());
-                    state.modules_stopped();
                 }
                 state.close_events();
                 state.flush_logs();

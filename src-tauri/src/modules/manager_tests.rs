@@ -1353,8 +1353,9 @@ fn exit_order_stops_modules_before_the_bus_closes_and_nothing_follows() {
         assert_eq!(state.request_exit(), ExitStep::StopModules);
         assert_eq!(state.request_exit(), ExitStep::Wait);
         let report = state.modules().shutdown().await.expect("shutdown");
-        state.modules_stopped();
+        assert!(state.modules_stopped(), "request the exit again");
         assert_eq!(state.request_exit(), ExitStep::Exit, "a second exit passes");
+        assert!(!state.begin_exit(), "Exit has nothing left to stop");
         assert_eq!(report.stopped, [id("t.a")]);
         let expected = [
             change("t.b", true, "Stopping"),

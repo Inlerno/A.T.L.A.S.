@@ -26,6 +26,8 @@ enum ExitPhase {
     Running,
     StoppingModules,
     ModulesStopped,
+    /// `RunEvent::Exit` has begun: the process ends right after it.
+    Exiting,
 }
 
 /// What to do with an exit request.
@@ -69,17 +71,31 @@ impl AppState {
                 ExitStep::StopModules
             }
             ExitPhase::StoppingModules => ExitStep::Wait,
-            ExitPhase::ModulesStopped => ExitStep::Exit,
+            ExitPhase::ModulesStopped | ExitPhase::Exiting => ExitStep::Exit,
         }
     }
 
-    /// Records that the modules have stopped (or were terminated).
-    pub fn modules_stopped(&self) {
-        *lock(&self.exit) = ExitPhase::ModulesStopped;
+    /// Records that the modules have stopped (or were terminated). Returns
+    /// `true` if the exit must now be requested again, `false` if
+    /// `RunEvent::Exit` has already begun: requesting an exit then could end
+    /// the process before the logs are flushed.
+    pub fn modules_stopped(&self) -> bool {
+        let mut phase = lock(&self.exit);
+        if *phase == ExitPhase::Exiting {
+            return false;
+        }
+        *phase = ExitPhase::ModulesStopped;
+        true
     }
 
-    pub fn are_modules_stopped(&self) -> bool {
-        *lock(&self.exit) == ExitPhase::ModulesStopped
+    /// Called at `RunEvent::Exit`. Returns `true` if the modules still have to
+    /// be stopped there, because the exit could not be postponed (e.g. on a
+    /// restart).
+    pub fn begin_exit(&self) -> bool {
+        let mut phase = lock(&self.exit);
+        let pending = *phase != ExitPhase::ModulesStopped;
+        *phase = ExitPhase::Exiting;
+        pending
     }
 
     /// Closes the event bus: subscribers receive the events published before,
@@ -213,18 +229,33 @@ mod tests {
     #[test]
     fn exit_requests_stop_modules_once_and_then_let_the_exit_pass() {
         let state = state(None);
-        assert!(!state.are_modules_stopped());
         assert_eq!(state.request_exit(), ExitStep::StopModules);
         assert_eq!(state.request_exit(), ExitStep::Wait);
         assert_eq!(state.request_exit(), ExitStep::Wait);
-        state.modules_stopped();
-        assert!(state.are_modules_stopped());
+        assert!(state.modules_stopped(), "request the exit again");
         assert_eq!(state.request_exit(), ExitStep::Exit);
         assert_eq!(
             state.request_exit(),
             ExitStep::Exit,
             "no loop: every later request passes"
         );
+        assert!(!state.begin_exit(), "the modules are already stopped");
+    }
+
+    #[test]
+    fn an_exit_that_could_not_wait_stops_the_modules_itself() {
+        // E.g. a restart: `RunEvent::Exit` arrives while the modules stop.
+        let state = state(None);
+        assert_eq!(state.request_exit(), ExitStep::StopModules);
+        assert!(state.begin_exit(), "Exit must stop the modules itself");
+        assert!(
+            !state.modules_stopped(),
+            "the background stop must not request another exit"
+        );
+        assert_eq!(state.request_exit(), ExitStep::Exit);
+
+        let untouched = state_with(None, EventBus::new(DEFAULT_CAPACITY));
+        assert!(untouched.begin_exit(), "no exit request at all");
     }
 
     #[test]
