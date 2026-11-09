@@ -4,6 +4,105 @@
 
 ---
 
+## 2026-11-09 — Issue #9: MM-4 — жизненный цикл модулей, изоляция сбоев, выход
+
+Менеджер жизненного цикла: `src-tauri/src/modules/{contract,context,manager}.rs`. Решение — ADR-014; описание — раздел «Module Manager» и «Завершение приложения» в `ARCHITECTURE.md`.
+
+### Что сделано
+- `contract.rs`:
+  - трейты `Module` (`initialize` / `start` / `stop` / `health_check`) и `ModuleFactory`;
+  - `Health`, `ModuleFailure`;
+  - `ModuleStatus::is_consistent()` — проверка инварианта (решение 23).
+- `context.rs`: `ModuleContext` — подписка на шину, токен отмены, фоновые задачи под надзором (`TaskTracker` + `CancellationToken`).
+- `manager.rs`:
+  - actor с командами по `mpsc` и ответами по `oneshot`, снимок статусов в `watch` (только чтение);
+  - выполнение планов, изоляция вызовов, каскад `Blocked`, health по запросу;
+  - выход с общим таймаутом, таймауты как именованные константы, тексты для пользователя.
+- `events/types.rs`: событие `ModuleEvent::HealthChanged`.
+- `app/state.rs`, `lib.rs`: менеджер создаётся в `setup` (модули не запускаются). Выход идёт в порядке решения 28: первый `ExitRequested` откладывает выход и останавливает модули, повторный проходит, затем на `Exit` вызываются `close_events()` и `flush_logs()`.
+- Прочее: `clock.rs` (общий `unix_time_ms` для шины и менеджера), `ModuleGraph: Default` (пустой граф для некорректного каталога), `modules::catalog()` (пока пуст).
+- CI: шаг, запрещающий `panic = "abort"` в `src-tauri/Cargo.toml`. Проверен локально: чистый файл — успех, `panic = "abort"` и `panic='abort'` — ошибка.
+
+### Решения, которых нет в тексте #9 (на согласование)
+1. **`async-trait` не добавлен**: используются ручные `Pin<Box<dyn Future + Send>>` — вариант, предусмотренный #9.
+2. **`macros` не подключён** (решение 27): вместо `select!` используется `CancellationToken::run_until_cancelled`.
+3. **`Module: Send + Sync`**: future от `health_check(&self)` должен быть `Send`.
+4. **Проверка health без ответа держит экземпляр.** Экземпляр остаётся у проверки и не теряется, состояние не меняется. Новая проверка не запускается. Поздний ответ возвращает экземпляр, поздняя паника → `Failed { HealthCheck }` с каскадом. При остановке менеджер ждёт проверку в пределах таймаута `stop`; если ответа нет — модуль останавливается без вызова `stop` (`Failed { Stop }`).
+5. **`HealthChanged`** публикуется только при изменении значения.
+6. **`stop` не вызывается** после неудачных `initialize` / `start`: экземпляр не запускался. Запущенное им отменяется и прерывается.
+7. **`Failed` выставляется сразу** при обнаружении сбоя, освобождение ресурсов идёт после. Для сбоев во время работы это порядок из #9; для остальных сбоев — тот же.
+8. **Запрос выхода** прерывает идущие `initialize` / `start` / `health` сразу. Оставшиеся шаги плана пропускаются (`interrupted`). После запроса `apply` и `check_health` возвращают `ShutDown`.
+9. **Тексты для пользователя** написаны по-русски, как «проверка не ответила» в #9, и собраны в `manager::text`. Ошибка, которую вернул сам модуль, показывается как есть: контракт `ModuleFailure` требует, чтобы текст был безопасным для показа.
+10. **Некорректный каталог**: ошибка пишется в лог, приложение работает без модулей. Встроенный каталог проверяется тестом.
+11. **Значения таймаутов** и их обоснование — в ADR-014.
+
+### Зависимости
+| Крейт | Версия | Features | Лицензия | Зачем |
+|---|---|---|---|---|
+| `tokio` | 1.54.1 | добавлены `rt`, `time`; в `[dev-dependencies]` — `rt`, `time`, `test-util` | MIT | задача на каждый вызов модуля, таймауты; замороженное время в тестах |
+| `tokio-util` | 0.7.20 (уже в `Cargo.lock`) | `rt` | MIT | `CancellationToken`, `TaskTracker` |
+
+Новых пакетов в `Cargo.lock` нет. Изменились только связи: у `atlas` появился `tokio-util`, у `tokio-util` — `futures-util`, который уже был в `Cargo.lock`. `async-trait` и `tokio-macros` не добавлены.
+
+### Тесты
+35 тестов менеджера на `FakeModule` (`testing.rs`): поведение каждой фазы задаётся сценарием, счётчики ведутся для экземпляров и вызовов.
+- **Время.** Тесты идут на однопоточном runtime с замороженным временем: таймауты истекают мгновенно и детерминированно, независимо от скорости машины.
+- **Проверка каждого события.** Каждое событие проверяется на инвариант и на непрерывность: `previous` должен совпадать с прошлым `current` того же модуля. Снимок проверяется на совпадение с опубликованными событиями.
+
+| Требование пользователя | Тесты |
+|---|---|
+| Одновременные команды | `concurrent_commands_are_handled_one_after_another`, `a_failure_report_waits_for_the_command_in_progress` |
+| Отключение модуля с зависимыми | `disable_with_dependents_stops_them_in_reverse_order_and_disables_them` |
+| Сбой при запуске | `initialize_and_start_failures_fail_the_module_with_the_phase` (ошибка, паника, таймаут × 2 фазы), `a_failure_in_the_middle_of_a_plan_blocks_the_rest_without_retries` |
+| Сбой при остановке | `a_failed_stop_does_not_prevent_stopping_the_others`, `a_module_whose_stop_fails_during_restart_is_not_started_again`, `background_tasks_that_ignore_cancellation_are_aborted` |
+| Восстановление после ошибки | `recover_is_confirmed_even_alone_and_restarts_blocked_dependents_in_order`, `nothing_restarts_on_its_own` |
+| Зависший модуль при выходе | `shutdown_stops_modules_in_reverse_order_within_the_overall_timeout`, `at_the_exit_deadline_the_modules_left_are_terminated`, `exit_interrupts_an_initialize_in_progress`, `exit_skips_the_rest_of_a_plan_in_progress` |
+| Нет событий после `close_events()` | `exit_order_stops_modules_before_the_bus_closes_and_nothing_follows` |
+| Инвариант после каждого перехода | проверка в каждом тесте, `the_status_invariant_holds_through_a_long_scenario`, `status_consistency_invariant` |
+
+**Мутационная проверка.** 17 намеренных поломок менеджера и контекста, все 17 обнаружены. Среди них:
+- снимок не обновляется;
+- зависимые останавливаются в прямом порядке;
+- нет каскада после сбоя;
+- повторный запуск упавшего модуля;
+- не ответившая проверка health теряет экземпляр;
+- остановка не ограничена сроком выхода;
+- модули не завершаются принудительно по сроку;
+- менеджер работает после команды выхода;
+- принимаются отчёты остановленного экземпляра;
+- нет отмены после неудачного запуска;
+- `disable` скрывает `Failed { Stop }`;
+- нет прерывания `initialize` или плана при выходе;
+- нет `abort` у задач;
+- заблокированный модуль выключается (нарушение инварианта).
+
+Две поломки сначала выжили: повторный запуск после неудачной остановки при `restart` и выполнение плана после запроса выхода. Для них добавлены тесты.
+
+**Найдено и исправлено в тестах.** Тест «детали паники — только в лог» иногда не видел записей лога при параллельном запуске. Причина — кеш интереса `tracing` к местам логирования. Он общий для процесса: пока зарегистрирован один подписчик, интерес нового места вычисляется по подписчику того потока, который первым до него дошёл. Параллельный тест без подписчика кешировал «не интересно», и подписчик теста, заданный для его потока (`set_default`), этих записей не получал. Теперь в бинаре unit-тестов один глобальный подписчик с буфером на поток.
+
+**Стабильность** (облачный Linux): без сбоев прошли 100 прогонов тестов модулей, 50 прогонов всех unit-тестов, 30 — на одном ядре, 20 — в один поток.
+
+### Временное разрешение неиспользуемого кода
+`#[cfg_attr(not(test), allow(dead_code))]` на `mod modules;` и `mod events;` остаётся до #11 (решение 22). В тестовой сборке разрешение не действует.
+
+### Проверки в облачном Linux
+| Проверка | Результат |
+|---|---|
+| `cargo fmt --check` | OK |
+| `cargo clippy --locked --all-targets -- -D warnings` | OK (в том числе тестовая сборка) |
+| `cargo test --locked` | 112 тестов OK; 39 новых: 35 в `modules::manager_tests`, 2 в `contract`, 2 в `app::state` |
+| `cargo doc --no-deps --document-private-items` с `-D warnings` | OK |
+| `npm run build` | OK |
+| Smoke-тест под Xvfb (Linux, **не Windows**) | окно открывается и закрывается, код выхода 0. Лог в порядке решения 28: `module manager started modules=0` → `exit requested: stopping modules` → `modules stopped for exit stopped=0 failed=0` → `module manager stopped` → `exit requested` → `ATLAS exiting` → `event bus closed` |
+
+### Проверка на Windows
+Критерий #9: «приложение запускается и закрывается; в логе есть старт и остановка менеджера (модулей пока нет)». У пользователя сейчас нет доступа к ПК, поэтому ручная проверка **отложена**; решение — за пользователем.
+
+Что проверить:
+- в `%LOCALAPPDATA%\com.inlerno.atlas\logs` есть строка `module manager started modules=0`;
+- после закрытия окна — строки `exit requested: stopping modules`, `modules stopped for exit stopped=0 failed=0`, `module manager stopped`, `exit requested`, `ATLAS exiting`, `event bus closed`;
+- процесс завершается без задержки.
+
 ## 2026-11-09 — Issue #8: MM-3 — центральная шина событий
 
 Центральная типизированная шина уведомлений: `src-tauri/src/events/{mod,types,bus}.rs`. Решение — ADR-013 (включает решения 24 и 25 из #13); описание — раздел «Event Bus» в `ARCHITECTURE.md`.
