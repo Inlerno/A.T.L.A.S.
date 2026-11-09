@@ -2,6 +2,11 @@ pub mod error;
 pub mod logging;
 
 mod app;
+// TODO(#11): remove this temporary allowance once IPC commands consume the
+// module manager. Until then the MM-2 code has no consumers outside tests
+// (agreed plan, decision 22 in #13).
+#[cfg_attr(not(test), allow(dead_code))]
+mod modules;
 
 use tauri::Manager;
 
