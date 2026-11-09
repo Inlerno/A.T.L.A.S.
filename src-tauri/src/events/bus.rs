@@ -7,7 +7,9 @@
 //! or starts enable, disable, recover, restart or any automatic recovery.
 //!
 //! Delivery guarantees:
-//! - `publish` assigns `seq` and enqueues the event under one lock, so the
+//! - `publish`, `subscribe` and `close` each take effect under one bus lock,
+//!   so they happen one after another and never interleave;
+//! - `publish` assigns `seq` and enqueues the event under that lock, so the
 //!   `seq` order is the delivery order for every subscriber, also when several
 //!   threads publish at once; events published by one thread keep its order;
 //! - a subscriber receives only the events published after it subscribed;
@@ -19,6 +21,11 @@
 //!   subscribers are not affected;
 //! - after `close` (or when the last handle is dropped) subscribers receive
 //!   every event published before it, then `Closed`.
+//!
+//! Requirement for callers: a waker used to poll [`Subscriber::recv`] must not
+//! call the bus (`publish`, `subscribe` or `close`) synchronously. Subscribers
+//! are woken while the bus lock is held, so such a call would deadlock. Wakers
+//! of tokio and other common executors only schedule the task and meet this.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,6 +110,9 @@ impl EventBus {
     /// delivered to nobody, which is not an error. The caller cannot choose
     /// the source.
     ///
+    /// Waiting subscribers are woken during this call while the bus lock is
+    /// held: their wakers must not call the bus (see the module requirement).
+    ///
     /// # Errors
     ///
     /// [`BusClosed`] after [`close`](Self::close); no `seq` is used then.
@@ -117,6 +127,10 @@ impl EventBus {
             source: EventSource::Core,
             event,
         };
+        // The event has its `seq` but is not sent yet: tests stop a publisher
+        // here to check that nothing can overtake it.
+        #[cfg(test)]
+        test_hooks::before_send(envelope.seq);
         // Sending under the lock makes the `seq` order the delivery order.
         // `send` fails only when nobody is subscribed: the event is then
         // delivered to nobody, which is fine for a notification.
@@ -158,6 +172,8 @@ impl EventBus {
     /// state stays consistent even if a lock holder panicked: a poisoned lock
     /// is recovered instead of spreading the panic.
     fn lock(&self) -> MutexGuard<'_, Shared> {
+        #[cfg(test)]
+        test_hooks::before_lock(&self.shared);
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -173,7 +189,9 @@ impl Subscriber {
     /// Waits for the next event, a lag report or the end of the bus.
     ///
     /// Cancel safe: if the future is dropped before it completes, no event is
-    /// lost.
+    /// lost. The waker of the task polling this future is called while the
+    /// bus lock is held, so it must not call the bus synchronously (see the
+    /// module requirement).
     pub async fn recv(&mut self) -> Received {
         let Some(receiver) = self.receiver.as_mut() else {
             return Received::Closed;
@@ -196,13 +214,54 @@ fn unix_time_ms() -> u64 {
         })
 }
 
+/// Interception points that let a test force a particular interleaving of
+/// threads instead of waiting for a race to happen. Compiled only into the
+/// test build: the application has no hooks. A hook is set per thread, so
+/// tests running in parallel do not affect each other.
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, TryLockError};
+
+    type BeforeSend = Option<Box<dyn FnMut(u64)>>;
+    type BeforeWait = Option<Box<dyn FnMut()>>;
+
+    thread_local! {
+        /// Called by `publish` on this thread once the event has its `seq`,
+        /// just before it is sent; the bus lock is held at that moment.
+        pub(super) static BEFORE_SEND: RefCell<BeforeSend> = const { RefCell::new(None) };
+        /// Called on this thread when it is about to wait for the bus lock
+        /// because another thread holds it.
+        pub(super) static BEFORE_WAIT: RefCell<BeforeWait> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_send(seq: u64) {
+        BEFORE_SEND.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(seq);
+            }
+        });
+    }
+
+    pub(super) fn before_lock<T>(lock: &Mutex<T>) {
+        BEFORE_WAIT.with_borrow_mut(|hook| {
+            if let Some(hook) = hook
+                && let Err(TryLockError::WouldBlock) = lock.try_lock()
+            {
+                hook();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::pin;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, mpsc};
     use std::task::{Context, Poll, Waker};
-    use std::thread;
+    use std::thread::{self, JoinHandle};
 
+    use super::test_hooks::{BEFORE_SEND, BEFORE_WAIT};
     use super::*;
     use crate::events::types::ModuleEvent;
     use crate::modules::contract::{FailurePhase, ModuleId, ModuleState, ModuleStatus};
@@ -270,6 +329,57 @@ mod tests {
     /// Nothing is waiting for the subscriber right now.
     fn is_idle(subscriber: &mut Subscriber) -> bool {
         poll_once(subscriber.recv()).is_pending()
+    }
+
+    /// What a helper thread reports to the test.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step {
+        /// About to wait for the bus lock held by another thread.
+        WaitsForLock,
+        /// Its call to the bus returned.
+        Done,
+    }
+
+    /// Starts a thread that publishes a status change of `module` and stops
+    /// once the event has its `seq` but is not sent yet, holding the bus lock.
+    /// Returns after the publisher has stopped, with its handle, its `seq` and
+    /// a sender that lets it continue.
+    fn start_paused_publisher(
+        bus: &EventBus,
+        module: &'static str,
+    ) -> (JoinHandle<Result<u64, BusClosed>>, u64, mpsc::Sender<()>) {
+        let (paused_tx, paused) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let bus = bus.clone();
+        let publisher = thread::spawn(move || {
+            BEFORE_SEND.set(Some(Box::new(move |seq: u64| {
+                paused_tx.send(seq).expect("the test waits for the pause");
+                resume_rx
+                    .recv()
+                    .expect("the test lets the publisher continue");
+            })));
+            bus.publish(status_changed(module))
+        });
+        let seq = paused.recv().expect("the publisher stops before sending");
+        (publisher, seq, resume)
+    }
+
+    /// Runs `call` on a new thread that reports [`Step::WaitsForLock`] if it
+    /// has to wait for the bus lock and [`Step::Done`] when `call` returns.
+    fn spawn_reporting<R: Send + 'static>(
+        steps: &mpsc::Sender<Step>,
+        call: impl FnOnce() -> R + Send + 'static,
+    ) -> JoinHandle<R> {
+        let steps = steps.clone();
+        thread::spawn(move || {
+            let waits = steps.clone();
+            BEFORE_WAIT.set(Some(Box::new(move || {
+                waits.send(Step::WaitsForLock).expect("the test listens");
+            })));
+            let result = call();
+            steps.send(Step::Done).expect("the test listens");
+            result
+        })
     }
 
     #[test]
@@ -467,8 +577,133 @@ mod tests {
         assert_eq!(ready(&mut subscriber), Received::Closed);
     }
 
+    // Deterministic interleavings: a publisher is stopped at the critical
+    // point (its event has a `seq` but is not sent yet) and the test checks
+    // what other threads can do meanwhile. No race has to happen by chance.
+
     #[test]
-    fn concurrent_publishers_get_unique_seq_and_one_delivery_order() {
+    fn overlapping_publications_are_delivered_in_seq_order() {
+        let bus = EventBus::new(8);
+        let mut subscribers = [bus.subscribe(), bus.subscribe(), bus.subscribe()];
+
+        // A has taken seq 1 and stopped right before sending its event.
+        let (publisher_a, seq_a, resume_a) = start_paused_publisher(&bus, "t.a");
+        assert_eq!(seq_a, 1);
+
+        // B and C publish while A's publication is in progress.
+        let (steps_tx, steps) = mpsc::channel();
+        let publisher_b = spawn_reporting(&steps_tx, {
+            let bus = bus.clone();
+            move || bus.publish(status_changed("t.b"))
+        });
+        let publisher_c = spawn_reporting(&steps_tx, {
+            let bus = bus.clone();
+            move || bus.publish(status_changed("t.c"))
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                steps.recv().expect("B and C make progress"),
+                Step::WaitsForLock,
+                "no publication can overtake one that already has its seq"
+            );
+        }
+
+        resume_a.send(()).expect("A continues");
+        assert_eq!(publisher_a.join().expect("publisher A"), Ok(1));
+        let seq_b = publisher_b.join().expect("publisher B").expect("open bus");
+        let seq_c = publisher_c.join().expect("publisher C").expect("open bus");
+        let mut later = [seq_b, seq_c];
+        later.sort_unstable();
+        assert_eq!(
+            later,
+            [2, 3],
+            "the waiting publishers take the next numbers"
+        );
+
+        // Every subscriber receives every event in the order of its seq.
+        let mut expected = vec![(1, id("t.a")), (seq_b, id("t.b")), (seq_c, id("t.c"))];
+        expected.sort();
+        for subscriber in &mut subscribers {
+            let received: Vec<(u64, ModuleId)> = (0..3)
+                .map(|_| {
+                    let envelope = next_event(subscriber);
+                    (envelope.seq, module_of(&envelope).clone())
+                })
+                .collect();
+            assert_eq!(received, expected);
+            assert!(is_idle(subscriber));
+        }
+    }
+
+    #[test]
+    fn close_waits_for_a_publication_in_progress() {
+        let bus = EventBus::new(8);
+        let mut subscriber = bus.subscribe();
+        let (publisher, seq, resume) = start_paused_publisher(&bus, "t.a");
+        assert_eq!(seq, 1);
+
+        let (steps_tx, steps) = mpsc::channel();
+        let closer = spawn_reporting(&steps_tx, {
+            let bus = bus.clone();
+            move || bus.close()
+        });
+        assert_eq!(
+            steps.recv().expect("the closing thread makes progress"),
+            Step::WaitsForLock,
+            "close waits until the publication in progress is sent"
+        );
+
+        resume.send(()).expect("the publisher continues");
+        assert_eq!(publisher.join().expect("publisher"), Ok(1));
+        closer.join().expect("closing thread");
+        assert_eq!(steps.recv().expect("close returns"), Step::Done);
+
+        assert_eq!(
+            next_seq(&mut subscriber),
+            1,
+            "the event is delivered before the end of the bus"
+        );
+        assert_eq!(ready(&mut subscriber), Received::Closed);
+        assert_eq!(bus.publish(status_changed("t.b")), Err(BusClosed));
+    }
+
+    #[test]
+    fn subscription_during_a_publication_starts_after_it() {
+        let bus = EventBus::new(8);
+        let mut early = bus.subscribe();
+        let (publisher, seq, resume) = start_paused_publisher(&bus, "t.a");
+        assert_eq!(seq, 1);
+
+        let (steps_tx, steps) = mpsc::channel();
+        let subscribing = spawn_reporting(&steps_tx, {
+            let bus = bus.clone();
+            move || bus.subscribe()
+        });
+        assert_eq!(
+            steps.recv().expect("the subscribing thread makes progress"),
+            Step::WaitsForLock,
+            "subscribe waits until the publication in progress is sent"
+        );
+
+        resume.send(()).expect("the publisher continues");
+        assert_eq!(publisher.join().expect("publisher"), Ok(1));
+        let mut late = subscribing.join().expect("subscribing thread");
+        assert!(
+            is_idle(&mut late),
+            "the event sent before the subscription is not delivered"
+        );
+
+        assert_eq!(bus.publish(status_changed("t.b")), Ok(2));
+        assert_eq!(next_seq(&mut late), 2);
+        assert_eq!(next_seq(&mut early), 1);
+        assert_eq!(next_seq(&mut early), 2);
+    }
+
+    // Stress checks: many random interleavings on top of the deterministic
+    // scenarios above.
+
+    #[test]
+    fn stress_many_publishers_and_readers_agree_on_seq_order() {
         const PUBLISHERS: usize = 8;
         const PER_PUBLISHER: usize = 400;
         const TOTAL: usize = PUBLISHERS * PER_PUBLISHER;
@@ -559,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn close_racing_with_publishers_loses_no_accepted_event() {
+    fn stress_close_racing_with_publishers_loses_no_accepted_event() {
         const PUBLISHERS: usize = 4;
         const ATTEMPTS: usize = 200;
         // Large enough that the subscriber never lags.
