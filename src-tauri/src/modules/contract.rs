@@ -23,16 +23,37 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The manager creates a new instance with its factory for every start and
 /// drops it after the stop or a failure. Each call runs in its own task with a
 /// timeout, so a panic or a hang in a module does not stop the application.
-/// Code that blocks a thread without yielding cannot be interrupted by a
-/// timeout; modules must not block.
+///
+/// **Resources.** The instance owns everything it allocates (files, sockets,
+/// devices, native handles, threads, child processes), and dropping the
+/// instance must release all of it. After a failure the manager only drops
+/// the instance, and after a panic or a timeout `Drop` is the only module
+/// code that still runs. Background tasks started with
+/// [`ModuleContext::spawn`] are cancelled and aborted by the manager;
+/// everything else is the module's responsibility.
+///
+/// **Blocking.** A timeout can interrupt a call only where it yields
+/// (`.await`). Code that blocks a thread without yielding, such as a blocking
+/// native call, cannot be interrupted by an ordinary async timeout: it holds
+/// the thread until it returns. Such code belongs on a separate thread (for
+/// example `tokio::task::spawn_blocking`), so that the module's async methods
+/// keep yielding.
 pub trait Module: Send + Sync {
-    /// Prepares the instance. Background work belongs in [`ModuleContext::spawn`].
+    /// Prepares the instance. Background work belongs in
+    /// [`ModuleContext::spawn`].
+    ///
+    /// If it fails, the module first releases whatever it has allocated so
+    /// far and only then returns the error: `stop` is not called for an
+    /// instance that did not start, and dropping the instance must leave
+    /// nothing behind.
     fn initialize<'a>(
         &'a mut self,
         ctx: &'a ModuleContext,
     ) -> BoxFuture<'a, Result<(), ModuleFailure>>;
 
-    /// Starts the work after a successful `initialize`.
+    /// Starts the work after a successful `initialize`. If it fails, the same
+    /// rule applies: release what was allocated, then return the error;
+    /// `stop` is not called.
     fn start<'a>(&'a mut self, ctx: &'a ModuleContext) -> BoxFuture<'a, Result<(), ModuleFailure>>;
 
     /// Stops the work of a started instance. Called once, after the context's

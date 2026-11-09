@@ -1445,22 +1445,34 @@ fn the_status_invariant_holds_through_a_long_scenario() {
 }
 
 #[test]
-fn an_invalid_catalog_leaves_the_manager_without_modules() {
-    run(async {
-        let (first, _) = FakeFactory::new("t.a", &[]);
-        let (second, _) = FakeFactory::new("t.a", &[]);
-        let catalog: Vec<Box<dyn ModuleFactory>> = vec![Box::new(first), Box::new(second)];
-        let (manager, actor) = manager::create(catalog, EventBus::new(8));
-        tokio::spawn(actor);
-        assert!(manager.statuses().is_empty());
-        let outcome = manager
-            .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
-            .await;
-        assert!(matches!(
-            outcome,
-            Err(ManagerError::Module(ModuleError::UnknownModule(_)))
-        ));
+fn an_invalid_catalog_is_logged_and_leaves_the_manager_without_modules() {
+    let logs = capture_logs(|| {
+        run(async {
+            let (first, _) = FakeFactory::new("t.a", &[]);
+            let (second, _) = FakeFactory::new("t.a", &[]);
+            let catalog: Vec<Box<dyn ModuleFactory>> = vec![Box::new(first), Box::new(second)];
+            let (manager, actor) = manager::create(catalog, EventBus::new(8));
+            tokio::spawn(actor);
+            assert!(manager.statuses().is_empty());
+            let outcome = manager
+                .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
+                .await;
+            assert!(matches!(
+                outcome,
+                Err(ManagerError::Module(ModuleError::UnknownModule(_)))
+            ));
+        });
     });
+    // Decision 11: a broken catalog is never ignored silently.
+    let line = logs
+        .lines()
+        .find(|line| line.contains("invalid module catalog"))
+        .unwrap_or_else(|| panic!("no catalog error in the log:\n{logs}"));
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(
+        line.contains("duplicate module id `t.a`"),
+        "the reason is logged: {line}"
+    );
 }
 
 #[test]
