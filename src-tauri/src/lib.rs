@@ -1,3 +1,13 @@
+pub mod error;
+pub mod logging;
+
+mod app;
+
+use tauri::Manager;
+
+use crate::app::AppState;
+use crate::error::AppError;
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -6,8 +16,40 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            // Must not fail: an error returned from setup makes Tauri panic.
+            // File logging problems fall back to stdout inside `logging::init`.
+            let log_dir = app.path().app_log_dir().map_err(AppError::from);
+            let rust_log = std::env::var("RUST_LOG").ok();
+            let log_guard = match logging::init(log_dir, rust_log.as_deref()) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("ATLAS: logging initialisation failed: {error}");
+                    None
+                }
+            };
+            logging::install_panic_hook();
+            tracing::info!(version = env!("CARGO_PKG_VERSION"), "ATLAS starting");
+            app.manage(AppState::new(log_guard));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![greet])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            tracing::info!("exit requested");
+        }
+        tauri::RunEvent::Exit => {
+            tracing::info!("ATLAS exiting");
+            // `App::run` ends the process with `std::process::exit`, so managed
+            // state is never dropped: flush the log file explicitly.
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                state.flush_logs();
+            }
+        }
+        _ => {}
+    });
 }
