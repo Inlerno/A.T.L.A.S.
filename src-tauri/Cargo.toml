@@ -25,7 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Core foundation (issue #6). Features are listed explicitly; do not rely on feature unification.
 thiserror = { version = "2.0.21", features = ["std"] }
-tracing = { version = "0.1.44", features = ["std"] }
+# default-features = false: the `attributes` feature (#[instrument], tracing-attributes) is not used.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["std", "registry", "fmt", "ansi", "env-filter", "tracing-log"] }
 tracing-appender = "0.2.5"
 

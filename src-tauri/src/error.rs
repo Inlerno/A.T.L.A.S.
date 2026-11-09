@@ -12,9 +12,9 @@ use thiserror::Error;
 /// therefore meant for logs, not for the UI.
 #[derive(Debug, Error)]
 pub enum AppError {
-    /// An application directory (e.g. the log directory) could not be resolved.
-    #[error("could not resolve application directory: {0}")]
-    Path(#[from] tauri::Error),
+    /// An error reported by Tauri (e.g. the log directory could not be resolved).
+    #[error("Tauri error: {0}")]
+    Tauri(#[from] tauri::Error),
 
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
