@@ -29,6 +29,12 @@ thiserror = { version = "2.0.21", features = ["std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["std", "registry", "fmt", "ansi", "env-filter", "tracing-log"] }
 tracing-appender = "0.2.5"
+# Event bus (issue #8): tokio::sync::broadcast. Already in the Tauri tree; declared explicitly.
+tokio = { version = "1.54.1", features = ["sync"] }
+
+[dev-dependencies]
+# Event bus unit tests run futures on a current-thread runtime (no `macros`: no new crate).
+tokio = { version = "1.54.1", features = ["rt"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
