@@ -1,14 +1,87 @@
-//! Module contract types (issue #7): identifiers, descriptors, statuses, errors.
+//! Module contract (issues #7 and #9): identifiers, descriptors, statuses,
+//! errors, and the `Module` / `ModuleFactory` traits implemented by modules.
 //!
-//! Pure data: no async and no runtime. The `Module` / `ModuleFactory` traits and
-//! `Health` are introduced with the lifecycle manager (#9). Status changes are
-//! published through the central typed event bus (#8) using these types.
+//! Status changes are published through the central typed event bus (#8)
+//! using these types; only the lifecycle manager changes statuses.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use thiserror::Error;
 
+use super::context::ModuleContext;
 use super::plan::ChangeAction;
+
+/// Future returned by module methods. Boxed by hand instead of using the
+/// `async-trait` crate: no extra dependency, and `Box<dyn Module>` works.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A module: compile-time Rust code that the lifecycle manager runs (#9,
+/// ADR-014).
+///
+/// The manager creates a new instance with its factory for every start and
+/// drops it after the stop or a failure. Each call runs in its own task with a
+/// timeout, so a panic or a hang in a module does not stop the application.
+/// Code that blocks a thread without yielding cannot be interrupted by a
+/// timeout; modules must not block.
+pub trait Module: Send + Sync {
+    /// Prepares the instance. Background work belongs in [`ModuleContext::spawn`].
+    fn initialize<'a>(
+        &'a mut self,
+        ctx: &'a ModuleContext,
+    ) -> BoxFuture<'a, Result<(), ModuleFailure>>;
+
+    /// Starts the work after a successful `initialize`.
+    fn start<'a>(&'a mut self, ctx: &'a ModuleContext) -> BoxFuture<'a, Result<(), ModuleFailure>>;
+
+    /// Stops the work of a started instance. Called once, after the context's
+    /// cancellation token is cancelled; not called if `initialize` or `start`
+    /// failed.
+    fn stop<'a>(&'a mut self, ctx: &'a ModuleContext) -> BoxFuture<'a, Result<(), ModuleFailure>>;
+
+    /// Informational check on request; it never changes the module status.
+    fn health_check(&self) -> BoxFuture<'_, Health>;
+}
+
+/// Catalog entry: describes a module and creates its instances.
+pub trait ModuleFactory: Send + Sync {
+    fn descriptor(&self) -> &ModuleDescriptor;
+
+    /// Creates a new instance. State of a previous instance is never reused.
+    fn create(&self) -> Box<dyn Module>;
+}
+
+/// Result of a health check. Informational: it is shown to the user and never
+/// starts, stops or restarts anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Health {
+    Healthy,
+    Degraded(String),
+    Unhealthy(String),
+}
+
+/// Error reported by a module from a lifecycle call or a background task.
+///
+/// The message is shown to the user, so it must not contain secrets, paths or
+/// internal details; a module logs those itself.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct ModuleFailure {
+    message: String,
+}
+
+impl ModuleFailure {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 /// Stable module identifier in the form `domain.name`, e.g. `ai.lmstudio`.
 ///
@@ -134,6 +207,15 @@ impl Default for ModuleStatus {
     }
 }
 
+impl ModuleStatus {
+    /// Status consistency invariant (decision 23 in #13): a module that is
+    /// initializing, starting, running, stopping or blocked is enabled.
+    pub fn is_consistent(&self) -> bool {
+        self.enabled
+            || !(self.state.is_active() || matches!(self.state, ModuleState::Blocked { .. }))
+    }
+}
+
 /// Errors of the module contract, graph and change plans.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ModuleError {
@@ -236,5 +318,63 @@ mod tests {
             path: vec![id("a.x"), id("b.y"), id("a.x")],
         };
         assert_eq!(err.to_string(), "dependency cycle: a.x -> b.y -> a.x");
+    }
+
+    #[test]
+    fn status_consistency_invariant() {
+        let blocked = ModuleState::Blocked {
+            by: ModuleId::new("t.a").expect("valid"),
+            reason: BlockReason::DependencyFailed,
+        };
+        let failed = ModuleState::Failed {
+            phase: FailurePhase::Stop,
+            error: "x".into(),
+            at: 0,
+        };
+        for state in [
+            ModuleState::Initializing,
+            ModuleState::Starting,
+            ModuleState::Running,
+            ModuleState::Stopping,
+            blocked,
+        ] {
+            assert!(
+                ModuleStatus {
+                    enabled: true,
+                    state: state.clone()
+                }
+                .is_consistent()
+            );
+            assert!(
+                !ModuleStatus {
+                    enabled: false,
+                    state
+                }
+                .is_consistent()
+            );
+        }
+        for state in [ModuleState::Stopped, failed] {
+            assert!(
+                ModuleStatus {
+                    enabled: true,
+                    state: state.clone()
+                }
+                .is_consistent()
+            );
+            assert!(
+                ModuleStatus {
+                    enabled: false,
+                    state
+                }
+                .is_consistent()
+            );
+        }
+    }
+
+    #[test]
+    fn module_failure_message_is_shown_as_is() {
+        let failure = ModuleFailure::new("no microphone");
+        assert_eq!(failure.message(), "no microphone");
+        assert_eq!(failure.to_string(), "no microphone");
     }
 }

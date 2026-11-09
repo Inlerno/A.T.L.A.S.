@@ -7,7 +7,7 @@
 //! with settings (#10), the demo event with #12. Events are notifications
 //! only and never carry secrets.
 
-use crate::modules::contract::{ModuleId, ModuleStatus};
+use crate::modules::contract::{Health, ModuleId, ModuleStatus};
 
 /// An event as delivered to subscribers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,4 +51,8 @@ pub enum ModuleEvent {
         previous: ModuleStatus,
         current: ModuleStatus,
     },
+    /// The result of an on-demand health check differs from the previous one
+    /// for the same running instance. Informational: it never changes the
+    /// status (#9).
+    HealthChanged { id: ModuleId, health: Health },
 }

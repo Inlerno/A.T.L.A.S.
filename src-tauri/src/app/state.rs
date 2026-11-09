@@ -1,28 +1,85 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::events::bus::EventBus;
+use crate::modules::manager::ModuleManagerHandle;
 
 /// State managed by Tauri (`app.manage`).
 ///
-/// Holds the log writer guard and the central event bus. `tauri::App::run`
-/// ends the process with `std::process::exit`, so destructors of managed state
-/// do not run. On `RunEvent::Exit` the bus is therefore closed explicitly
-/// ([`AppState::close_events`]) and then the guard is released
+/// Holds the log writer guard, the central event bus and the module manager.
+/// `tauri::App::run` ends the process with `std::process::exit`, so
+/// destructors of managed state do not run. The exit steps are therefore
+/// explicit (decision 28 in #13): stop the modules, then close the bus
+/// ([`AppState::close_events`]), then release the guard
 /// ([`AppState::flush_logs`]), which flushes buffered log records.
 pub struct AppState {
     log_guard: Mutex<Option<WorkerGuard>>,
     events: EventBus,
+    modules: ModuleManagerHandle,
+    exit: Mutex<ExitPhase>,
+}
+
+/// Where the application is on its way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitPhase {
+    Running,
+    StoppingModules,
+    ModulesStopped,
+}
+
+/// What to do with an exit request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStep {
+    /// First request: prevent the exit and stop the modules, then exit again.
+    StopModules,
+    /// The modules are still stopping: keep preventing the exit.
+    Wait,
+    /// The modules are stopped: let the application exit (no loop).
+    Exit,
 }
 
 impl AppState {
     /// `log_guard` is `None` when file logging is unavailable (stdout fallback).
-    pub fn new(log_guard: Option<WorkerGuard>, events: EventBus) -> Self {
+    pub fn new(
+        log_guard: Option<WorkerGuard>,
+        events: EventBus,
+        modules: ModuleManagerHandle,
+    ) -> Self {
         Self {
             log_guard: Mutex::new(log_guard),
             events,
+            modules,
+            exit: Mutex::new(ExitPhase::Running),
         }
+    }
+
+    pub fn modules(&self) -> &ModuleManagerHandle {
+        &self.modules
+    }
+
+    /// Decides what to do with an exit request. Exactly one caller gets
+    /// [`ExitStep::StopModules`]; a request after the modules have stopped
+    /// gets [`ExitStep::Exit`], so a second exit does not start a loop.
+    pub fn request_exit(&self) -> ExitStep {
+        let mut phase = lock(&self.exit);
+        match *phase {
+            ExitPhase::Running => {
+                *phase = ExitPhase::StoppingModules;
+                ExitStep::StopModules
+            }
+            ExitPhase::StoppingModules => ExitStep::Wait,
+            ExitPhase::ModulesStopped => ExitStep::Exit,
+        }
+    }
+
+    /// Records that the modules have stopped (or were terminated).
+    pub fn modules_stopped(&self) {
+        *lock(&self.exit) = ExitPhase::ModulesStopped;
+    }
+
+    pub fn are_modules_stopped(&self) -> bool {
+        *lock(&self.exit) == ExitPhase::ModulesStopped
     }
 
     /// Closes the event bus: subscribers receive the events published before,
@@ -53,6 +110,11 @@ impl AppState {
     }
 }
 
+/// The exit phase stays meaningful if a holder panicked: recover the lock.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +123,14 @@ mod tests {
     use crate::events::bus::{BusClosed, DEFAULT_CAPACITY};
     use crate::events::types::{AppEvent, ModuleEvent};
     use crate::modules::contract::{ModuleId, ModuleStatus};
+    use crate::modules::manager;
+
+    /// A state with a module manager whose actor never runs: these tests do
+    /// not send it commands.
+    fn state_with(log_guard: Option<WorkerGuard>, events: EventBus) -> AppState {
+        let (modules, _actor) = manager::create(Vec::new(), events.clone());
+        AppState::new(log_guard, events, modules)
+    }
 
     fn sink_guard() -> WorkerGuard {
         let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
@@ -68,7 +138,7 @@ mod tests {
     }
 
     fn state(log_guard: Option<WorkerGuard>) -> AppState {
-        AppState::new(log_guard, EventBus::new(DEFAULT_CAPACITY))
+        state_with(log_guard, EventBus::new(DEFAULT_CAPACITY))
     }
 
     #[test]
@@ -125,7 +195,7 @@ mod tests {
     #[test]
     fn close_events_closes_the_shared_bus_and_is_idempotent() {
         let bus = EventBus::new(DEFAULT_CAPACITY);
-        let state = AppState::new(None, bus.clone());
+        let state = state_with(None, bus.clone());
         let event = || {
             AppEvent::Module(ModuleEvent::StatusChanged {
                 id: ModuleId::new("t.a").expect("valid module id"),
@@ -138,5 +208,47 @@ mod tests {
         state.close_events();
         state.close_events();
         assert_eq!(bus.publish(event()), Err(BusClosed));
+    }
+
+    #[test]
+    fn exit_requests_stop_modules_once_and_then_let_the_exit_pass() {
+        let state = state(None);
+        assert!(!state.are_modules_stopped());
+        assert_eq!(state.request_exit(), ExitStep::StopModules);
+        assert_eq!(state.request_exit(), ExitStep::Wait);
+        assert_eq!(state.request_exit(), ExitStep::Wait);
+        state.modules_stopped();
+        assert!(state.are_modules_stopped());
+        assert_eq!(state.request_exit(), ExitStep::Exit);
+        assert_eq!(
+            state.request_exit(),
+            ExitStep::Exit,
+            "no loop: every later request passes"
+        );
+    }
+
+    #[test]
+    fn concurrent_exit_requests_start_the_stop_exactly_once() {
+        let state = Arc::new(state(None));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || state.request_exit())
+            })
+            .collect();
+        let steps: Vec<ExitStep> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("exit thread"))
+            .collect();
+        let starts = steps
+            .iter()
+            .filter(|step| **step == ExitStep::StopModules)
+            .count();
+        assert_eq!(starts, 1);
+        assert!(
+            steps
+                .iter()
+                .all(|step| matches!(step, ExitStep::StopModules | ExitStep::Wait))
+        );
     }
 }

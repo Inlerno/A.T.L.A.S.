@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::contract::{ModuleDescriptor, ModuleError, ModuleId};
 
-#[derive(Debug, Clone)]
+/// `Default` is the empty graph, used when the catalog is invalid (#9).
+#[derive(Debug, Clone, Default)]
 pub struct ModuleGraph {
     modules: BTreeMap<ModuleId, ModuleDescriptor>,
     /// Direct dependencies of each module.
