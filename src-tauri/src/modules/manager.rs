@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::{self, WeakUnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::context::{ModuleContext, TaskFailure, panic_text};
@@ -254,6 +254,7 @@ pub fn create(
         reports: commands_tx.downgrade(),
         shutdown: shutdown.clone(),
         next_instance: 0,
+        pending_drops: Vec::new(),
     };
     let handle = ModuleManagerHandle {
         commands: commands_tx,
@@ -324,6 +325,24 @@ struct Actor {
     reports: WeakUnboundedSender<Command>,
     shutdown: ShutdownSignal,
     next_instance: u64,
+    /// Drops the manager stopped waiting for. They may still run on the
+    /// blocking pool; their results are never read, so a late result changes
+    /// nothing.
+    pending_drops: Vec<PendingDrop>,
+}
+
+/// A drop of a module instance that was not confirmed in time.
+struct PendingDrop {
+    module: ModuleId,
+    task: JoinHandle<()>,
+}
+
+/// A lifecycle call that did not succeed: the text for the user and, when the
+/// module returned an error, the instance, which the caller drops off the
+/// manager task (D1).
+struct CallFailure {
+    error: String,
+    instance: Option<Box<dyn Module>>,
 }
 
 impl Actor {
@@ -367,6 +386,13 @@ impl Actor {
                 modules = self.running.len(),
                 "module manager ended with modules still running"
             );
+        }
+        // No instance is dropped in the manager task (D1): the instances left
+        // are dropped on the blocking pool, nobody waits for them.
+        for (_, Instance { slot, .. }) in std::mem::take(&mut self.running) {
+            if let Slot::Ready(module) = slot {
+                drop(drop_off_task(module));
+            }
         }
         tracing::info!("module manager stopped");
     }
@@ -500,18 +526,18 @@ impl Actor {
         self.set_state(id, ModuleState::Initializing);
         let module = match self.call(id, module, &context, Lifecycle::Initialize).await {
             Ok(module) => module,
-            Err(error) => {
+            Err(failure) => {
                 return Err(self
-                    .fail_start(id, FailurePhase::Initialize, error, &context)
+                    .fail_start(id, FailurePhase::Initialize, failure, &context)
                     .await);
             }
         };
         self.set_state(id, ModuleState::Starting);
         let module = match self.call(id, module, &context, Lifecycle::Start).await {
             Ok(module) => module,
-            Err(error) => {
+            Err(failure) => {
                 return Err(self
-                    .fail_start(id, FailurePhase::Start, error, &context)
+                    .fail_start(id, FailurePhase::Start, failure, &context)
                     .await);
             }
         };
@@ -526,18 +552,28 @@ impl Actor {
         Ok(())
     }
 
-    /// `initialize` or `start` failed: mark the module and release what the
-    /// instance spawned. `stop` is not called because the instance never
-    /// started; the instance itself is already dropped.
+    /// `initialize` or `start` failed. Decision 7: `Failed { phase }` first,
+    /// then the token is cancelled, the instance is dropped (off the manager
+    /// task, within `STOP_TIMEOUT`) and the background tasks are waited for
+    /// and aborted. A drop that blocks never delays the status. `stop` is not
+    /// called because the instance never started. After a panic, a timeout or
+    /// an interruption the manager has no instance to drop.
     async fn fail_start(
         &mut self,
         id: &ModuleId,
         phase: FailurePhase,
-        error: String,
+        failure: CallFailure,
         context: &ModuleContext,
     ) -> String {
+        let CallFailure { error, instance } = failure;
         self.set_state(id, failed(phase, &error));
         context.cancel();
+        if let Some(module) = instance {
+            // The status keeps the module's own error; the drop goes to the log.
+            let _ = self
+                .wait_drop(id, drop_off_task(module), STOP_TIMEOUT)
+                .await;
+        }
         let aborted = context
             .finish_tasks(TASKS_STOP_TIMEOUT, &self.shutdown.expired)
             .await;
@@ -548,15 +584,16 @@ impl Actor {
     }
 
     /// Runs a lifecycle call in its own task: a panic stays in that task, and
-    /// the manager goes on if the call never returns. Returns the instance or
-    /// the text for the user; details are logged.
+    /// the manager goes on if the call never returns. Returns the instance, or
+    /// the text for the user with the instance if the module returned an
+    /// error; details are logged.
     async fn call(
         &self,
         id: &ModuleId,
         module: Box<dyn Module>,
         context: &ModuleContext,
         call: Lifecycle,
-    ) -> Result<Box<dyn Module>, String> {
+    ) -> Result<Box<dyn Module>, CallFailure> {
         let (limit, stop_waiting) = match call {
             Lifecycle::Initialize => (INITIALIZE_TIMEOUT, &self.shutdown.requested),
             Lifecycle::Start => (START_TIMEOUT, &self.shutdown.requested),
@@ -565,28 +602,80 @@ impl Actor {
         let task = spawn_call(module, context.clone(), call);
         match wait_for(task, limit, stop_waiting).await {
             Waited::Done((module, Ok(()))) => Ok(module),
-            Waited::Done((_module, Err(failure))) => {
+            Waited::Done((module, Err(failure))) => {
                 tracing::error!(module = %id, call = call.name(), error = %failure, "module call failed");
-                Err(failure.message().to_owned())
+                Err(CallFailure {
+                    error: failure.message().to_owned(),
+                    instance: Some(module),
+                })
             }
             Waited::Panicked(payload) => {
                 tracing::error!(module = %id, call = call.name(), panic = %payload, "module call panicked");
-                Err(text::PANICKED.to_owned())
+                Err(CallFailure::without_instance(text::PANICKED))
             }
             Waited::TimedOut(task) => {
                 task.abort();
                 tracing::warn!(module = %id, call = call.name(), ?limit, "module call timed out");
-                Err(text::TIMED_OUT.to_owned())
+                Err(CallFailure::without_instance(text::TIMED_OUT))
             }
             Waited::Interrupted(task) => {
                 task.abort();
                 tracing::warn!(module = %id, call = call.name(), "module call interrupted: the application is exiting");
-                Err(match call {
+                Err(CallFailure::without_instance(match call {
                     Lifecycle::Stop => text::SHUTDOWN_DEADLINE,
                     Lifecycle::Initialize | Lifecycle::Start => text::INTERRUPTED,
-                }
-                .to_owned())
+                }))
             }
+        }
+    }
+
+    /// Waits for the drop of an instance (`drop_off_task`) at most `limit`
+    /// and not after the exit deadline. Only a drop that returned counts as
+    /// done. Otherwise the text for the user is returned and, if the drop may
+    /// still run, it is kept in `pending_drops` and never awaited again: the
+    /// waiting stops, the blocking task does not (it cannot be aborted).
+    async fn wait_drop(
+        &mut self,
+        id: &ModuleId,
+        task: JoinHandle<()>,
+        limit: Duration,
+    ) -> Result<(), String> {
+        match wait_for(task, limit, &self.shutdown.expired).await {
+            Waited::Done(()) => Ok(()),
+            Waited::Panicked(payload) => {
+                tracing::error!(module = %id, call = "drop", panic = %payload, "module instance drop panicked");
+                Err(text::PANICKED.to_owned())
+            }
+            Waited::TimedOut(task) => {
+                tracing::error!(module = %id, call = "drop", ?limit, "module instance drop did not finish in time");
+                self.keep_pending(id, task);
+                Err(text::TIMED_OUT.to_owned())
+            }
+            Waited::Interrupted(task) => {
+                // The exit deadline, or the blocking task was cancelled
+                // before it started (a `JoinError` without a panic).
+                let error = if self.shutdown.expired.is_cancelled() {
+                    tracing::error!(module = %id, call = "drop", "module instance drop not confirmed: the exit deadline has passed");
+                    text::SHUTDOWN_DEADLINE
+                } else {
+                    tracing::error!(module = %id, call = "drop", "module instance drop was cancelled before it ran");
+                    text::TIMED_OUT
+                };
+                self.keep_pending(id, task);
+                Err(error.to_owned())
+            }
+        }
+    }
+
+    /// Remembers a drop that may still run; finished ones are forgotten.
+    fn keep_pending(&mut self, id: &ModuleId, task: JoinHandle<()>) {
+        self.pending_drops
+            .retain(|pending| !pending.task.is_finished());
+        if !task.is_finished() {
+            self.pending_drops.push(PendingDrop {
+                module: id.clone(),
+                task,
+            });
         }
     }
 
@@ -610,17 +699,35 @@ impl Actor {
         }
     }
 
-    /// Stop sequence of a started instance: cancel the token → `stop` → wait
-    /// for the background tasks → abort the rest → drop the instance.
-    async fn release(&self, id: &ModuleId, instance: Instance) -> Result<(), String> {
+    /// Stop sequence of a started instance (MM-4 order): cancel the token →
+    /// `stop` → drop the instance → wait for the background tasks → abort the
+    /// rest. `stop` and the drop share one `STOP_TIMEOUT` (D1); the drop runs
+    /// off the manager task. The first error is kept: `stop`, then the drop,
+    /// then aborted tasks.
+    async fn release(&mut self, id: &ModuleId, instance: Instance) -> Result<(), String> {
         let Instance { context, slot } = instance;
         context.cancel();
         let mut error = None;
         match self.reclaim(id, slot).await {
-            Some(module) => match self.call(id, module, &context, Lifecycle::Stop).await {
-                Ok(stopped) => drop(stopped),
-                Err(stop_error) => error = Some(stop_error),
-            },
+            Some(module) => {
+                let budget = Instant::now() + STOP_TIMEOUT;
+                let stopped = match self.call(id, module, &context, Lifecycle::Stop).await {
+                    Ok(stopped) => Some(stopped),
+                    Err(CallFailure {
+                        error: stop_error,
+                        instance,
+                    }) => {
+                        error = Some(stop_error);
+                        instance
+                    }
+                };
+                if let Some(module) = stopped {
+                    let left = budget.saturating_duration_since(Instant::now());
+                    if let Err(drop_error) = self.wait_drop(id, drop_off_task(module), left).await {
+                        error.get_or_insert(drop_error);
+                    }
+                }
+            }
             None => error = Some(text::UNRESPONSIVE.to_owned()),
         }
         let aborted = context
@@ -835,9 +942,10 @@ impl Actor {
 
     /// Stops all running modules in reverse dependency order within the exit
     /// deadline. When the deadline has passed, the modules left are
-    /// terminated: their background tasks are aborted and the instance is
-    /// dropped without `stop`; they end up `Failed { phase: Stop }`. Every
-    /// status change is published before the manager ends.
+    /// terminated without `stop`: the instance is dropped off the manager task
+    /// without waiting and the background tasks are aborted; they end up
+    /// `Failed { phase: Stop }`. Drops not confirmed by then are logged. Every
+    /// status change is published before the manager replies.
     async fn shutdown(&mut self) -> StopReport {
         let order: Vec<ModuleId> = self
             .graph
@@ -869,6 +977,19 @@ impl Actor {
             failed = report.failed.len(),
             "modules stopped for exit"
         );
+        self.pending_drops
+            .retain(|pending| !pending.task.is_finished());
+        if !self.pending_drops.is_empty() {
+            let modules: Vec<String> = self
+                .pending_drops
+                .iter()
+                .map(|pending| pending.module.to_string())
+                .collect();
+            tracing::warn!(
+                modules = %modules.join(", "),
+                "module instance drops not confirmed at exit: they may still run"
+            );
+        }
         report
     }
 
@@ -876,10 +997,15 @@ impl Actor {
     fn terminate(&mut self, id: &ModuleId) -> String {
         if let Some(Instance { context, slot }) = self.running.remove(id) {
             context.cancel();
-            if let Slot::Checking(task) = &slot {
-                task.abort();
+            match slot {
+                // Dropped off the manager task and not waited for (D1).
+                Slot::Ready(module) => {
+                    let task = drop_off_task(module);
+                    self.keep_pending(id, task);
+                }
+                Slot::Checking(task) => task.abort(),
+                Slot::Lost => {}
             }
-            drop(slot);
             let aborted = context.abort_tasks();
             tracing::error!(module = %id, aborted, "module terminated: the exit deadline has passed");
         }
@@ -973,6 +1099,22 @@ impl Lifecycle {
             Self::Stop => "stop",
         }
     }
+}
+
+impl CallFailure {
+    fn without_instance(error: &str) -> Self {
+        Self {
+            error: error.to_owned(),
+            instance: None,
+        }
+    }
+}
+
+/// Drops a module instance on the blocking pool, never in the manager task
+/// (D1): a panic in `Drop` stays in that task, and a `Drop` that blocks holds
+/// only a pool thread. A blocking task that has started cannot be aborted.
+fn drop_off_task(module: Box<dyn Module>) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || drop(module))
 }
 
 /// Moves the instance into its own task for one call and returns it from there.

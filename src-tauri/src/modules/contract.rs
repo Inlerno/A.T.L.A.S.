@@ -32,6 +32,15 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// [`ModuleContext::spawn`] are cancelled and aborted by the manager;
 /// everything else is the module's responsibility.
 ///
+/// **Dropping.** The manager drops an instance on a thread of tokio's
+/// blocking pool, never in its own task, and waits for the drop only within
+/// the stop limit: what is left of it after `stop`, or the whole limit after a
+/// failed `initialize` or `start`. After a successful `stop`, a `Drop` that
+/// panics or does not return in time fails the stop (`Failed { phase: Stop }`).
+/// A `Drop` that does not return is no longer waited for but keeps running: a
+/// blocking task cannot be interrupted. `Drop` should release its resources
+/// promptly and never block indefinitely.
+///
 /// **Blocking.** A timeout can interrupt a call only where it yields
 /// (`.await`). Code that blocks a thread without yielding, such as a blocking
 /// native call, cannot be interrupted by an ordinary async timeout: it holds

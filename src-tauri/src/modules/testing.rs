@@ -1,13 +1,14 @@
 //! Test doubles for the lifecycle manager (issue #9).
 //!
 //! `FakeFactory` creates `FakeModule` instances whose behaviour in each phase
-//! is scripted (succeed, fail, panic, hang). A shared `Probe` counts created
-//! and dropped instances and calls, and can end the background task of the
-//! current instance on demand. Panic messages contain a fake path so tests
+//! is scripted (succeed, fail, panic, hang), and so is dropping the instance
+//! (normal, panic, block until the test releases it). A shared `Probe` counts
+//! created and dropped instances and calls, and can end the background task of
+//! the current instance on demand. Panic messages contain a fake path so tests
 //! can check that such details stay out of user-visible texts.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -54,6 +55,21 @@ pub enum Background {
     FailsOnCancel,
 }
 
+/// What dropping an instance does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropBehavior {
+    Normal,
+    /// Panics, unless the thread is already unwinding (a second panic would
+    /// abort the test binary).
+    Panic,
+    /// Blocks the thread until the test calls `Probe::release_drops`, or at
+    /// most `DROP_BLOCK_LIMIT`, so a broken test cannot hang forever.
+    Block,
+}
+
+/// Upper limit of `DropBehavior::Block`.
+pub const DROP_BLOCK_LIMIT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct Script {
     pub initialize: Behavior,
@@ -61,6 +77,7 @@ pub struct Script {
     pub stop: Behavior,
     pub health: HealthBehavior,
     pub background: Background,
+    pub drop: DropBehavior,
 }
 
 impl Default for Script {
@@ -71,6 +88,7 @@ impl Default for Script {
             stop: Behavior::Succeed,
             health: HealthBehavior::Answer(Health::Healthy),
             background: Background::Cooperative,
+            drop: DropBehavior::Normal,
         }
     }
 }
@@ -86,13 +104,21 @@ pub enum TaskEnd {
 #[derive(Default)]
 pub struct Probe {
     pub created: AtomicUsize,
+    /// Drops begun (also those that panic or block).
     pub dropped: AtomicUsize,
+    /// Drops that returned normally.
+    pub drops_finished: AtomicUsize,
     pub initialized: AtomicUsize,
     pub started: AtomicUsize,
     pub stopped: AtomicUsize,
     pub health_checks: AtomicUsize,
     /// Background tasks currently alive.
     pub background: AtomicUsize,
+    /// Value of `background` at the start of each drop, in order.
+    pub background_at_drop: Mutex<Vec<usize>>,
+    /// Set by `release_drops`: blocked drops return, later ones do not block.
+    drops_released: Mutex<bool>,
+    drop_released: Condvar,
     script: Mutex<Script>,
     trigger: Mutex<Option<oneshot::Sender<TaskEnd>>>,
     context: Mutex<Option<ModuleContext>>,
@@ -125,6 +151,21 @@ impl Probe {
     /// Subscription the latest instance took in `initialize`.
     pub fn take_subscriber(&self) -> Option<Subscriber> {
         lock(&self.subscriber).take()
+    }
+
+    /// Lets every blocked drop return; later drops of this module no longer
+    /// block.
+    pub fn release_drops(&self) {
+        *lock(&self.drops_released) = true;
+        self.drop_released.notify_all();
+    }
+
+    fn wait_for_release(&self) {
+        let released = lock(&self.drops_released);
+        let _released = self
+            .drop_released
+            .wait_timeout_while(released, DROP_BLOCK_LIMIT, |released| !*released)
+            .unwrap_or_else(PoisonError::into_inner);
     }
 
     fn current(&self) -> Script {
@@ -179,7 +220,16 @@ struct FakeModule {
 
 impl Drop for FakeModule {
     fn drop(&mut self) {
-        self.probe.dropped.fetch_add(1, Ordering::SeqCst);
+        let probe = &self.probe;
+        lock(&probe.background_at_drop).push(probe.background.load(Ordering::SeqCst));
+        probe.dropped.fetch_add(1, Ordering::SeqCst);
+        match probe.current().drop {
+            DropBehavior::Normal => {}
+            DropBehavior::Panic if std::thread::panicking() => {}
+            DropBehavior::Panic => panic!("fake drop panic in /secret/path/drop.rs"),
+            DropBehavior::Block => probe.wait_for_release(),
+        }
+        probe.drops_finished.fetch_add(1, Ordering::SeqCst);
     }
 }
 

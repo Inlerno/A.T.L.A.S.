@@ -22,10 +22,13 @@ use super::contract::{
 use super::graph::ModuleGraph;
 use super::manager::{
     self, ApplyOutcome, ApplyReport, HEALTH_CHECK_TIMEOUT, INITIALIZE_TIMEOUT, ManagerError,
-    ModuleManagerHandle, SHUTDOWN_TIMEOUT, START_TIMEOUT, STOP_TIMEOUT, TASKS_STOP_TIMEOUT, text,
+    ModuleManagerHandle, SHUTDOWN_TIMEOUT, START_TIMEOUT, STOP_TIMEOUT, StopReport,
+    TASKS_STOP_TIMEOUT, text,
 };
 use super::plan::{ChangeAction, Confirmation};
-use super::testing::{Background, Behavior, FakeFactory, HealthBehavior, Probe, TaskEnd};
+use super::testing::{
+    Background, Behavior, DropBehavior, FakeFactory, HealthBehavior, Probe, TaskEnd,
+};
 use crate::app::{AppState, ExitStep};
 use crate::events::bus::{EventBus, Received, Subscriber};
 use crate::events::types::{AppEvent, ModuleEvent};
@@ -1482,4 +1485,383 @@ fn the_built_in_catalog_is_valid() {
         .map(|factory| factory.descriptor().clone())
         .collect::<Vec<_>>();
     assert!(ModuleGraph::build(descriptors).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// PR #20 fixes D1, D2, L1 (`claude/PR20_FIX_PLAN.md`, revision 3).
+// ---------------------------------------------------------------------------
+
+/// Values of `background` seen by the drops of `probe`'s instances.
+fn background_at_drop(probe: &Probe) -> Vec<usize> {
+    probe
+        .background_at_drop
+        .lock()
+        .expect("drop record")
+        .clone()
+}
+
+/// Test 77. The stop order of MM-4 that ADR-014 now describes: the token is
+/// cancelled, `stop` runs, the instance is dropped, and only then are the
+/// background tasks waited for and the rest aborted.
+#[test]
+fn the_instance_is_dropped_before_its_tasks_are_waited_for() {
+    run(async {
+        let mut h = harness(&[("t.a", &[])]);
+        h.probe("t.a")
+            .script(|script| script.background = Background::IgnoresCancellation);
+        h.confirm(ChangeAction::Enable, "t.a").await;
+        h.changes();
+        let probe = Arc::clone(h.probe("t.a"));
+
+        let started = Instant::now();
+        h.confirm(ChangeAction::Disable, "t.a").await;
+        assert_eq!(
+            started.elapsed(),
+            TASKS_STOP_TIMEOUT,
+            "the tasks were waited for after stop and the drop"
+        );
+        assert_eq!(
+            background_at_drop(&probe),
+            [1],
+            "the task was still alive when the instance was dropped"
+        );
+        assert_eq!(count(&probe.stopped), 1, "stop ran before the drop");
+        let status = h.status("t.a");
+        assert!(!status.enabled);
+        assert_eq!(kind(&status.state), "Failed(Stop)");
+        assert_eq!(failed_error(&status), text::TASKS_ABORTED);
+        settle().await;
+        assert_eq!(count(&probe.background), 0, "then the task was aborted");
+    });
+}
+
+/// The single log line containing `message`; fails with the whole log
+/// otherwise.
+fn log_line<'a>(logs: &'a str, message: &str) -> &'a str {
+    let mut lines = logs.lines().filter(|line| line.contains(message));
+    let line = lines
+        .next()
+        .unwrap_or_else(|| panic!("no `{message}` in the log:\n{logs}"));
+    assert!(lines.next().is_none(), "`{message}` logged twice:\n{logs}");
+    line
+}
+
+/// Waits, in real time, for something another thread (the blocking pool)
+/// does; fails after ten seconds instead of hanging.
+fn wait_for_thread(mut condition: impl FnMut() -> bool) {
+    let limit = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < limit,
+            "the other thread did not get there"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Test 73 (D1). A `Drop` that panics after a successful `stop` does not end
+/// the manager: the stop counts as failed (`Failed { Stop }` with the usual
+/// text, the cause in the log), the next command runs, and at exit the other
+/// modules are still stopped with `stop`.
+#[test]
+fn a_panicking_drop_after_stop_fails_the_stop_and_the_manager_keeps_working() {
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[]), ("t.c", &[])]);
+            for module in ["t.a", "t.b", "t.c"] {
+                h.confirm(ChangeAction::Enable, module).await;
+            }
+            h.probe("t.a")
+                .script(|script| script.drop = DropBehavior::Panic);
+            h.changes();
+
+            // disable
+            let report = h.confirm(ChangeAction::Disable, "t.a").await;
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(report.failed[0].error, text::PANICKED);
+            let status = h.status("t.a");
+            assert!(!status.enabled, "disable keeps enabled = false");
+            assert_eq!(kind(&status.state), "Failed(Stop)");
+            assert_eq!(failed_error(&status), text::PANICKED);
+            assert_eq!(
+                h.changes(),
+                [
+                    change("t.a", true, "Stopping"),
+                    change("t.a", true, "Failed(Stop)"),
+                    change("t.a", false, "Failed(Stop)"),
+                ]
+            );
+            assert_eq!(count(&h.probe("t.a").dropped), 1);
+            assert_eq!(count(&h.probe("t.a").drops_finished), 0);
+
+            // the manager keeps working
+            assert_eq!(h.manager.check_health(id("t.c")).await, Ok(Health::Healthy));
+
+            // exit: t.b panics in Drop, t.c and the rest stop normally
+            h.probe("t.b")
+                .script(|script| script.drop = DropBehavior::Panic);
+            h.changes();
+            let report = h.manager.shutdown().await.expect("shutdown");
+            assert_eq!(report.stopped, [id("t.c")]);
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(report.failed[0].id, id("t.b"));
+            assert_eq!(report.failed[0].error, text::PANICKED);
+            let mut expected = stop_cycle("t.c", true);
+            expected.push(change("t.b", true, "Stopping"));
+            expected.push(change("t.b", true, "Failed(Stop)"));
+            assert_eq!(h.changes(), expected);
+            for module in ["t.b", "t.c"] {
+                assert_eq!(count(&h.probe(module).stopped), 1, "{module}: stop ran");
+            }
+            settle().await;
+            assert!(h.changes().is_empty(), "nothing after the reply");
+        });
+    });
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("module instance drop panicked"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs}");
+    for (line, module) in lines.iter().zip(["t.a", "t.b"]) {
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains(&format!("module={module}")), "{line}");
+        assert!(line.contains("call=\"drop\""), "{line}");
+        assert!(line.contains("fake drop panic"), "{line}");
+    }
+}
+
+/// Test 75 (D1, decision 7). A failed `initialize` whose `Drop` panics keeps
+/// the module's own error as the root cause; the drop goes to the log. After
+/// a failed `stop` the stop error stays, whatever the drop does.
+#[test]
+fn a_panicking_drop_after_a_failed_initialize_keeps_the_root_cause() {
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            h.probe("t.a").script(|script| {
+                script.initialize = Behavior::Fail;
+                script.drop = DropBehavior::Panic;
+            });
+            let report = h.confirm(ChangeAction::Enable, "t.a").await;
+            assert_eq!(report.failed[0].error, "fake initialize error");
+            let status = h.status("t.a");
+            assert_eq!(kind(&status.state), "Failed(Initialize)");
+            assert_eq!(failed_error(&status), "fake initialize error");
+            assert_eq!(count(&h.probe("t.a").dropped), 1);
+
+            // the manager keeps working
+            h.confirm(ChangeAction::Enable, "t.b").await;
+            assert_eq!(h.status("t.b").state, ModuleState::Running);
+
+            // a failed stop and a panicking drop: the stop error stays
+            h.probe("t.b").script(|script| {
+                script.stop = Behavior::Fail;
+                script.drop = DropBehavior::Panic;
+            });
+            h.changes();
+            let report = h.confirm(ChangeAction::Disable, "t.b").await;
+            assert_eq!(report.failed[0].error, "fake stop error");
+            assert_eq!(failed_error(&h.status("t.b")), "fake stop error");
+            assert_eq!(count(&h.probe("t.b").dropped), 1);
+        });
+    });
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("module instance drop panicked"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs}");
+    assert!(lines[0].contains("module=t.a"), "{}", lines[0]);
+    assert!(lines[1].contains("module=t.b"), "{}", lines[1]);
+}
+
+/// Test 75, variant (D1-9, decision 7). After a failed `initialize`,
+/// `Failed { Initialize }` is published before the instance is dropped: a
+/// `Drop` that blocks does not delay it, and its late end changes nothing.
+#[test]
+fn a_blocked_drop_after_a_failed_initialize_does_not_delay_the_failed_status() {
+    run(async {
+        let mut h = harness(&[("t.a", &[])]);
+        let probe = Arc::clone(h.probe("t.a"));
+        probe.script(|script| {
+            script.initialize = Behavior::Fail;
+            script.drop = DropBehavior::Block;
+        });
+        let enabling = {
+            let manager = h.manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
+                    .await
+            })
+        };
+        wait_until(|| kind(&h.status("t.a").state) == "Failed(Initialize)").await;
+        wait_for_thread(|| count(&probe.dropped) == 1);
+        assert_eq!(count(&probe.drops_finished), 0, "the drop is still blocked");
+        assert!(
+            !enabling.is_finished(),
+            "the manager still waits for the drop"
+        );
+        assert_eq!(
+            h.changes(),
+            [
+                change("t.a", true, "Stopped"),
+                change("t.a", true, "Initializing"),
+                change("t.a", true, "Failed(Initialize)"),
+            ],
+            "Failed was published while the drop was blocked"
+        );
+
+        probe.release_drops();
+        let outcome = enabling.await.expect("enable task").expect("enable");
+        let ApplyOutcome::Applied(report) = outcome else {
+            panic!("not applied: {outcome:?}");
+        };
+        assert_eq!(report.failed[0].error, "fake initialize error");
+        assert_eq!(count(&probe.drops_finished), 1);
+        settle().await;
+        assert!(h.changes().is_empty(), "the late drop changed nothing");
+        assert_eq!(failed_error(&h.status("t.a")), "fake initialize error");
+    });
+}
+
+/// Test 76 (D1). At the exit deadline a module is terminated: its drop starts
+/// off the manager task and is not waited for, so a `Drop` that panics there
+/// does not stop the exit, and its late end changes nothing.
+#[test]
+fn a_panicking_drop_of_a_terminated_module_does_not_stop_the_exit() {
+    run(async {
+        let modules: [(&str, &[&str]); 4] =
+            [("t.w", &[]), ("t.x", &[]), ("t.y", &[]), ("t.z", &[])];
+        let mut h = harness(&modules);
+        for (module, _) in modules {
+            h.confirm(ChangeAction::Enable, module).await;
+        }
+        // Exit order z, y, x, w (as in the MM-4 deadline test): z hangs until
+        // its stop timeout (5 s), y stops after 4 s, x hangs and is cut off at
+        // the deadline (10 s), w gets no turn, is terminated and panics in
+        // Drop.
+        h.probe("t.z").script(|script| script.stop = Behavior::Hang);
+        h.probe("t.y")
+            .script(|script| script.stop = Behavior::Delay(Duration::from_secs(4)));
+        h.probe("t.x").script(|script| script.stop = Behavior::Hang);
+        h.probe("t.w")
+            .script(|script| script.drop = DropBehavior::Panic);
+        h.changes();
+
+        let started = Instant::now();
+        let report = h.manager.shutdown().await.expect("shutdown");
+        assert_eq!(started.elapsed(), SHUTDOWN_TIMEOUT);
+        let errors: Vec<(String, String)> = report
+            .failed
+            .iter()
+            .map(|failure| (failure.id.to_string(), failure.error.clone()))
+            .collect();
+        assert_eq!(report.stopped, [id("t.y")]);
+        assert_eq!(
+            errors,
+            [
+                ("t.z".to_owned(), text::TIMED_OUT.to_owned()),
+                ("t.x".to_owned(), text::SHUTDOWN_DEADLINE.to_owned()),
+                ("t.w".to_owned(), text::SHUTDOWN_DEADLINE.to_owned()),
+            ]
+        );
+        assert_eq!(count(&h.probe("t.w").stopped), 0, "w got no stop");
+        h.changes();
+        settle().await;
+        assert_eq!(count(&h.probe("t.w").dropped), 1, "w was dropped");
+        assert_eq!(count(&h.probe("t.w").drops_finished), 0, "and panicked");
+        assert!(h.changes().is_empty(), "the late drop changed nothing");
+        assert_eq!(failed_error(&h.status("t.w")), text::SHUTDOWN_DEADLINE);
+    });
+}
+
+/// Test 66 (D1, MM-4 regression). An `initialize` interrupted by the exit is
+/// aborted; the instance is dropped by tokio inside the aborted task, so a
+/// `Drop` that panics there does not affect the manager.
+#[test]
+fn a_panicking_drop_of_an_aborted_call_does_not_affect_the_manager() {
+    run(async {
+        let mut h = harness(&[("t.a", &[])]);
+        h.probe("t.a").script(|script| {
+            script.initialize = Behavior::Hang;
+            script.drop = DropBehavior::Panic;
+        });
+        let enabling = {
+            let manager = h.manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
+                    .await
+            })
+        };
+        wait_until(|| h.status("t.a").state == ModuleState::Initializing).await;
+        let report = h.manager.shutdown().await.expect("shutdown");
+        assert_eq!(report, StopReport::default());
+        let status = h.status("t.a");
+        assert_eq!(kind(&status.state), "Failed(Initialize)");
+        assert_eq!(failed_error(&status), text::INTERRUPTED);
+        enabling.await.expect("enable task").expect("enable");
+        settle().await;
+        assert_eq!(count(&h.probe("t.a").dropped), 1, "dropped by tokio");
+        h.changes();
+    });
+}
+
+/// Test 68 (D1). Real time: a frozen clock cannot model a `Drop` that blocks
+/// a pool thread. The drop of t.b blocks past the rest of its stop budget:
+/// the manager stops waiting, t.b ends `Failed { Stop, TIMED_OUT }`, t.a is
+/// still stopped, the reply comes while the drop is still blocked, and the
+/// late end of the drop changes nothing. Only lower time bounds are checked.
+#[test]
+fn a_drop_that_does_not_return_in_time_fails_the_stop_and_the_exit_goes_on() {
+    let logs = capture_logs(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+                    h.confirm(ChangeAction::Enable, "t.a").await;
+                    h.confirm(ChangeAction::Enable, "t.b").await;
+                    let probe = Arc::clone(h.probe("t.b"));
+                    probe.script(|script| script.drop = DropBehavior::Block);
+                    h.changes();
+
+                    let started = std::time::Instant::now();
+                    let report = h.manager.shutdown().await.expect("shutdown");
+                    assert!(
+                        started.elapsed() >= STOP_TIMEOUT,
+                        "the drop got the rest of the stop budget"
+                    );
+                    assert_eq!(count(&probe.dropped), 1, "the drop began");
+                    assert_eq!(count(&probe.drops_finished), 0, "and is still blocked");
+                    assert_eq!(report.stopped, [id("t.a")]);
+                    assert_eq!(report.failed.len(), 1);
+                    assert_eq!(report.failed[0].id, id("t.b"));
+                    assert_eq!(report.failed[0].error, text::TIMED_OUT);
+                    let mut expected = vec![
+                        change("t.b", true, "Stopping"),
+                        change("t.b", true, "Failed(Stop)"),
+                    ];
+                    expected.extend(stop_cycle("t.a", true));
+                    assert_eq!(h.changes(), expected);
+
+                    probe.release_drops();
+                    wait_for_thread(|| count(&probe.drops_finished) == 1);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    assert!(h.changes().is_empty(), "the late drop changed nothing");
+                    assert_eq!(failed_error(&h.status("t.b")), text::TIMED_OUT);
+                })
+                .await
+                .expect("the test finished within a minute");
+            });
+    });
+    let line = log_line(&logs, "module instance drop did not finish in time");
+    assert!(
+        line.contains("ERROR") && line.contains("module=t.b"),
+        "{line}"
+    );
+    let line = log_line(&logs, "module instance drops not confirmed at exit");
+    assert!(line.contains("WARN") && line.contains("t.b"), "{line}");
 }
