@@ -16,8 +16,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::context::ModuleContext;
 use super::contract::{
-    FailurePhase, Health, ModuleError, ModuleFactory, ModuleId, ModuleState, ModuleStatus,
+    FailurePhase, Health, ModuleError, ModuleFactory, ModuleFailure, ModuleId, ModuleState,
+    ModuleStatus,
 };
 use super::graph::ModuleGraph;
 use super::manager::{
@@ -428,6 +430,7 @@ fn capture_logs(test: impl FnOnce()) -> String {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .with_writer(|| ThreadLog)
             .finish();
@@ -1337,56 +1340,66 @@ fn exit_skips_the_rest_of_a_plan_in_progress() {
 
 #[test]
 fn exit_order_stops_modules_before_the_bus_closes_and_nothing_follows() {
-    run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
-        h.confirm(ChangeAction::Enable, "t.a").await;
-        h.confirm(ChangeAction::Enable, "t.b").await;
-        h.probe("t.b").script(|script| script.stop = Behavior::Hang);
-        h.changes();
-        let state = AppState::new(None, h.bus.clone(), h.manager.clone());
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            h.confirm(ChangeAction::Enable, "t.a").await;
+            h.confirm(ChangeAction::Enable, "t.b").await;
+            h.probe("t.b").script(|script| script.stop = Behavior::Hang);
+            h.changes();
+            let state = AppState::new(None, h.bus.clone(), h.manager.clone());
 
-        // A background task fails while the modules are stopping: the report
-        // arrives after the stops have begun and is not acted upon.
-        let probe = Arc::clone(h.probe("t.a"));
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            probe.end_background(TaskEnd::Panic);
+            // A background task fails while the modules are stopping: the report
+            // arrives after the stops have begun and is not acted upon.
+            let probe = Arc::clone(h.probe("t.a"));
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                probe.end_background(TaskEnd::Panic);
+            });
+
+            assert_eq!(state.request_exit(), ExitStep::StopModules);
+            assert_eq!(state.request_exit(), ExitStep::Wait);
+            let report = state.modules().shutdown().await.expect("shutdown");
+            assert!(state.modules_stopped(), "request the exit again");
+            assert_eq!(state.request_exit(), ExitStep::Exit, "a second exit passes");
+            assert!(!state.begin_exit(), "Exit has nothing left to stop");
+            assert_eq!(report.stopped, [id("t.a")]);
+            let expected = [
+                change("t.b", true, "Stopping"),
+                change("t.b", true, "Failed(Stop)"),
+                change("t.a", true, "Stopping"),
+                change("t.a", true, "Stopped"),
+            ];
+            assert_eq!(
+                h.changes(),
+                expected,
+                "every stop is published before the bus closes"
+            );
+
+            state.close_events();
+            settle().await;
+            assert_eq!(poll_once(h.events.recv()), Poll::Ready(Received::Closed));
+            let late = h
+                .manager
+                .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
+                .await;
+            assert_eq!(late, Err(ManagerError::ShutDown));
+            assert_eq!(
+                h.manager.check_health(id("t.a")).await,
+                Err(ManagerError::ShutDown)
+            );
+            assert_eq!(h.manager.shutdown().await, Err(ManagerError::ShutDown));
+            assert_eq!(poll_once(h.events.recv()), Poll::Ready(Received::Closed));
         });
-
-        assert_eq!(state.request_exit(), ExitStep::StopModules);
-        assert_eq!(state.request_exit(), ExitStep::Wait);
-        let report = state.modules().shutdown().await.expect("shutdown");
-        assert!(state.modules_stopped(), "request the exit again");
-        assert_eq!(state.request_exit(), ExitStep::Exit, "a second exit passes");
-        assert!(!state.begin_exit(), "Exit has nothing left to stop");
-        assert_eq!(report.stopped, [id("t.a")]);
-        let expected = [
-            change("t.b", true, "Stopping"),
-            change("t.b", true, "Failed(Stop)"),
-            change("t.a", true, "Stopping"),
-            change("t.a", true, "Stopped"),
-        ];
-        assert_eq!(
-            h.changes(),
-            expected,
-            "every stop is published before the bus closes"
-        );
-
-        state.close_events();
-        settle().await;
-        assert_eq!(poll_once(h.events.recv()), Poll::Ready(Received::Closed));
-        let late = h
-            .manager
-            .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
-            .await;
-        assert_eq!(late, Err(ManagerError::ShutDown));
-        assert_eq!(
-            h.manager.check_health(id("t.a")).await,
-            Err(ManagerError::ShutDown)
-        );
-        assert_eq!(h.manager.shutdown().await, Err(ManagerError::ShutDown));
-        assert_eq!(poll_once(h.events.recv()), Poll::Ready(Received::Closed));
     });
+    // D2: the report of t.a, which arrived while the modules were stopping,
+    // is logged with its text once the queue is taken, and changed nothing.
+    let line = log_line(&logs, "background task failed after the exit request");
+    assert!(
+        line.contains("WARN") && line.contains("module=t.a"),
+        "{line}"
+    );
+    assert!(line.contains("panic: fake background panic"), "{line}");
 }
 
 #[test]
@@ -1864,4 +1877,274 @@ fn a_drop_that_does_not_return_in_time_fails_the_stop_and_the_exit_goes_on() {
     );
     let line = log_line(&logs, "module instance drops not confirmed at exit");
     assert!(line.contains("WARN") && line.contains("t.b"), "{line}");
+}
+
+/// Like `wait_until`, for a condition that is reached only after an instance
+/// drop on the blocking pool (D1): between yields it gives the pool threads
+/// real time, which matters on a single core. Fails after ten seconds.
+async fn wait_until_with_pool(mut condition: impl FnMut() -> bool) {
+    let limit = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(std::time::Instant::now() < limit, "condition not reached");
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Lets every ready task on this thread run a few times: enough for a
+/// background task to end and its supervisor to send the report.
+async fn run_ready_tasks() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Test 50 (D2). A failure report that waits in the queue behind a command
+/// while the exit is requested is only logged: no `Failed { Run }`, no
+/// cascade; the module and its dependent are stopped by `shutdown_all`, and
+/// the result of that stop decides their status.
+#[test]
+fn a_queued_failure_report_is_not_handled_after_the_exit_request() {
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &[])]);
+            h.confirm(ChangeAction::Enable, "t.b").await;
+            h.probe("t.c")
+                .script(|script| script.initialize = Behavior::Hang);
+            h.changes();
+            let enabling = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .apply(ChangeAction::Enable, id("t.c"), confirmed(&[]))
+                        .await
+                })
+            };
+            wait_until(|| h.status("t.c").state == ModuleState::Initializing).await;
+            // The report of t.a waits behind the enable of t.c.
+            assert!(h.probe("t.a").end_background(TaskEnd::Fail));
+            wait_until(|| count(&h.probe("t.a").background) == 0).await;
+            run_ready_tasks().await;
+
+            let report = h.manager.shutdown().await.expect("shutdown");
+            enabling.await.expect("enable task").expect("enable");
+            assert_eq!(report.stopped, [id("t.b"), id("t.a")]);
+            assert!(report.failed.is_empty());
+            let mut expected = vec![
+                change("t.c", true, "Stopped"),
+                change("t.c", true, "Initializing"),
+                change("t.c", true, "Failed(Initialize)"),
+            ];
+            expected.extend(stop_cycle("t.b", true));
+            expected.extend(stop_cycle("t.a", true));
+            assert_eq!(h.changes(), expected, "no Failed(Run), no Blocked");
+            assert_eq!(
+                count(&h.probe("t.a").stopped),
+                1,
+                "t.a was stopped with stop"
+            );
+        });
+    });
+    let line = log_line(&logs, "background task failed after the exit request");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("module=t.a"), "{line}");
+    assert!(
+        line.contains("fake background error"),
+        "the text is kept: {line}"
+    );
+    assert!(
+        !logs
+            .lines()
+            .any(|line| line.contains("ERROR") && line.contains("background task failed")),
+        "the report was not handled as a failure of a running module:\n{logs}"
+    );
+}
+
+/// Test 53 (D2). The report of an instance stopped before the exit, read
+/// after the exit request, is a `debug` line with the text.
+#[test]
+fn a_report_of_a_stopped_instance_is_logged_by_its_level() {
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[])]);
+            h.probe("t.a")
+                .script(|script| script.background = Background::FailsOnCancel);
+            h.confirm(ChangeAction::Enable, "t.a").await;
+            // The restart stops the old instance (its task fails while it
+            // stops, the report is queued) and then hangs in the new
+            // instance's initialize until the exit interrupts it.
+            h.probe("t.a").script(|script| {
+                script.background = Background::Cooperative;
+                script.initialize = Behavior::Hang;
+            });
+            h.changes();
+            let restarting = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .apply(ChangeAction::Restart, id("t.a"), confirmed(&[]))
+                        .await
+                })
+            };
+            // The restart drops the old instance on the blocking pool first.
+            wait_until_with_pool(|| h.status("t.a").state == ModuleState::Initializing).await;
+            run_ready_tasks().await;
+            let report = h.manager.shutdown().await.expect("shutdown");
+            restarting.await.expect("restart task").expect("restart");
+            assert_eq!(report, StopReport::default());
+            let status = h.status("t.a");
+            assert_eq!(kind(&status.state), "Failed(Initialize)");
+            assert_eq!(failed_error(&status), text::INTERRUPTED);
+        });
+    });
+    let line = log_line(
+        &logs,
+        "background task of a stopped instance failed after the exit request",
+    );
+    assert!(line.contains("DEBUG"), "{line}");
+    assert!(line.contains("module=t.a"), "{line}");
+    assert!(
+        line.contains("fake error while stopping"),
+        "the text is kept: {line}"
+    );
+    assert!(
+        !logs.contains("background task failed after the exit request"),
+        "{logs}"
+    );
+}
+
+/// Test 74 (D2). A report the manager can no longer take — its queue is
+/// closed, or the manager is gone — is logged by the supervisor itself.
+#[test]
+fn a_failure_that_cannot_be_reported_is_logged() {
+    let logs = capture_logs(|| {
+        run(async {
+            // The queue is closed: `send` fails.
+            let (reports, queue) = tokio::sync::mpsc::unbounded_channel::<manager::Command>();
+            drop(queue);
+            let context = ModuleContext::new(id("t.a"), 7, EventBus::new(16), reports.downgrade());
+            context.spawn("closed queue", async {
+                Err(ModuleFailure::new("fake error after the exit"))
+            });
+            wait_until(|| context.tasks_alive() == 0).await;
+            drop(reports);
+
+            // No sender is left: `upgrade` fails.
+            let (reports, _queue) = tokio::sync::mpsc::unbounded_channel::<manager::Command>();
+            let weak = reports.downgrade();
+            drop(reports);
+            let context = ModuleContext::new(id("t.b"), 8, EventBus::new(16), weak);
+            context.spawn("no manager", async {
+                panic!("fake panic after the exit in /secret/path/late.rs")
+            });
+            wait_until(|| context.tasks_alive() == 0).await;
+        });
+    });
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("the module manager can no longer be told"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs}");
+    assert!(
+        lines[0].contains("WARN") && lines[1].contains("WARN"),
+        "{logs}"
+    );
+    assert!(
+        lines[0].contains("module=t.a")
+            && lines[0].contains("instance=7")
+            && lines[0].contains("closed queue")
+            && lines[0].contains("fake error after the exit"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("module=t.b") && lines[1].contains("fake panic after the exit"),
+        "{}",
+        lines[1]
+    );
+}
+
+/// Test 71 (D2). Messages that arrive while `shutdown_all` runs start
+/// nothing: a failure report is only logged and its module is still stopped
+/// with `stop` (`Stopped`, its dependent not `Blocked`); commands get
+/// `ShutDown`; the end of a late health check is ignored; the only events are
+/// those of `shutdown_all`.
+#[test]
+fn messages_arriving_during_shutdown_all_start_nothing() {
+    let logs =
+        capture_logs(|| {
+            run(async {
+                let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.h", &[])]);
+                h.confirm(ChangeAction::Enable, "t.b").await;
+                h.confirm(ChangeAction::Enable, "t.h").await;
+                // t.h: a health check that answers after 7 s, so it still holds
+                // the instance when the exit begins and ends during the stops.
+                h.probe("t.h").script(|script| {
+                    script.health = HealthBehavior::Late {
+                        after: Duration::from_secs(7),
+                        panic: false,
+                    };
+                });
+                assert_eq!(
+                    h.manager.check_health(id("t.h")).await,
+                    Ok(Health::Unhealthy(text::HEALTH_NO_ANSWER.to_owned()))
+                );
+                h.probe("t.b")
+                    .script(|script| script.stop = Behavior::Delay(Duration::from_secs(3)));
+                h.changes();
+
+                let exiting = {
+                    let manager = h.manager.clone();
+                    tokio::spawn(async move { manager.shutdown().await })
+                };
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(h.probe("t.a").end_background(TaskEnd::Fail));
+                let disabling = {
+                    let manager = h.manager.clone();
+                    tokio::spawn(async move {
+                        manager
+                            .apply(ChangeAction::Disable, id("t.a"), confirmed(&["t.b"]))
+                            .await
+                    })
+                };
+                let checking = {
+                    let manager = h.manager.clone();
+                    tokio::spawn(async move { manager.check_health(id("t.a")).await })
+                };
+
+                let report = exiting.await.expect("exit task").expect("shutdown");
+                assert_eq!(disabling.await.expect("task"), Err(ManagerError::ShutDown));
+                assert_eq!(checking.await.expect("task"), Err(ManagerError::ShutDown));
+                assert!(report.failed.is_empty(), "{report:?}");
+                assert_eq!(report.stopped.len(), 3);
+                for module in ["t.a", "t.b", "t.h"] {
+                    assert_eq!(
+                        h.status(module),
+                        ModuleStatus {
+                            enabled: true,
+                            state: ModuleState::Stopped
+                        },
+                        "{module}"
+                    );
+                    assert_eq!(count(&h.probe(module).stopped), 1, "{module}: one stop");
+                }
+                let changes = h.changes();
+                assert_eq!(changes.len(), 6, "{changes:?}");
+                assert!(
+                    changes.iter().all(|(_, enabled, state)| *enabled
+                        && (state == "Stopping" || state == "Stopped")),
+                    "only the stops of shutdown_all: {changes:?}"
+                );
+                settle().await;
+                assert!(h.events().is_empty(), "nothing after the reply");
+            });
+        });
+    let line = log_line(&logs, "background task failed after the exit request");
+    assert!(
+        line.contains("WARN") && line.contains("module=t.a"),
+        "{line}"
+    );
+    assert!(line.contains("fake background error"), "{line}");
+    log_line(&logs, "stopping modules: the application is exiting");
+    assert!(!logs.contains("Failed { phase: Run"), "{logs}");
 }

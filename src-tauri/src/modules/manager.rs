@@ -373,13 +373,11 @@ impl Actor {
                     self.health_check_ended(&id, instance).await;
                 }
                 Command::Shutdown { reply } => {
-                    let report = self.shutdown().await;
-                    let _ = reply.send(report);
+                    self.exit(reply, &mut commands).await;
                     break;
                 }
             }
         }
-        // Commands still queued are dropped and their callers get `ShutDown`.
         // Nothing is published after this point.
         if !self.running.is_empty() {
             tracing::warn!(
@@ -395,6 +393,34 @@ impl Actor {
             }
         }
         tracing::info!("module manager stopped");
+    }
+
+    /// The exit command (decision 28, D2): stop the modules, then close the
+    /// queue and take what is left in it (reports are only logged, commands
+    /// get `ShutDown`), and send the report.
+    async fn exit(
+        &mut self,
+        reply: oneshot::Sender<StopReport>,
+        commands: &mut mpsc::UnboundedReceiver<Command>,
+    ) {
+        // Instances running when the exit began, to choose the log level of
+        // their late reports.
+        let running_at_exit: BTreeSet<(ModuleId, u64)> = self
+            .running
+            .iter()
+            .map(|(id, instance)| (id.clone(), instance.context.instance()))
+            .collect();
+        let report = self.shutdown().await;
+
+        // After `close` nothing new arrives: a supervisor whose report cannot
+        // be sent logs it itself. What is already queued is still received.
+        commands.close();
+        let mut repeated = Vec::new();
+        while let Some(command) = commands.recv().await {
+            exit_message(command, &running_at_exit, &mut repeated);
+        }
+        let _ = reply.send(report);
+        drop(repeated);
     }
 
     async fn apply(
@@ -763,6 +789,10 @@ impl Actor {
     }
 
     /// A supervised background task of a running instance failed.
+    ///
+    /// After the exit request the report is only logged (D2): no status
+    /// change, no stop, no cascade; `shutdown_all` stops the module and its
+    /// result decides the final status.
     async fn task_failed(
         &mut self,
         id: &ModuleId,
@@ -774,8 +804,12 @@ impl Actor {
             .running
             .get(id)
             .map(|running| running.context.instance());
+        if self.shutdown.requested.is_cancelled() {
+            log_exit_report(id, instance, task, &failure, current == Some(instance));
+            return;
+        }
         if current != Some(instance) {
-            tracing::debug!(module = %id, task, "ignoring a report of an instance that is gone");
+            tracing::debug!(module = %id, task, error = %failure, "ignoring a report of an instance that is gone");
             return;
         }
         let error = match failure {
@@ -1098,6 +1132,54 @@ impl Lifecycle {
             Self::Start => "start",
             Self::Stop => "stop",
         }
+    }
+}
+
+/// One message taken from the queue during the exit: nothing is executed.
+/// Reports are only logged, commands get `ShutDown`, the end of a late health
+/// check needs nothing (`shutdown_all` has taken the instance back or
+/// terminated the module), and repeated exit requests get `ShutDown` after
+/// the reply.
+fn exit_message(
+    command: Command,
+    running_at_exit: &BTreeSet<(ModuleId, u64)>,
+    repeated: &mut Vec<oneshot::Sender<StopReport>>,
+) {
+    match command {
+        Command::Apply { reply, .. } => {
+            let _ = reply.send(Err(ManagerError::ShutDown));
+        }
+        Command::CheckHealth { reply, .. } => {
+            let _ = reply.send(Err(ManagerError::ShutDown));
+        }
+        Command::TaskFailed {
+            id,
+            instance,
+            task,
+            failure,
+        } => {
+            let running = running_at_exit.contains(&(id.clone(), instance));
+            log_exit_report(&id, instance, task, &failure, running);
+        }
+        Command::HealthCheckEnded { .. } => {}
+        Command::Shutdown { reply } => repeated.push(reply),
+    }
+}
+
+/// A background task failure reported after the exit request: only logged
+/// (D2). `warn` for an instance still running when the exit began, `debug`
+/// for one stopped before; the text is kept in both.
+fn log_exit_report(
+    id: &ModuleId,
+    instance: u64,
+    task: &'static str,
+    failure: &TaskFailure,
+    running_at_exit: bool,
+) {
+    if running_at_exit {
+        tracing::warn!(module = %id, instance, task, error = %failure, "background task failed after the exit request");
+    } else {
+        tracing::debug!(module = %id, instance, task, error = %failure, "background task of a stopped instance failed after the exit request");
     }
 }
 

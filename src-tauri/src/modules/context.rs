@@ -7,6 +7,7 @@
 //! publish events (#12).
 
 use std::any::Any;
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -28,6 +29,16 @@ pub(super) enum TaskFailure {
     Error(ModuleFailure),
     /// The task panicked; the payload text goes to the log only.
     Panic(String),
+}
+
+/// For the log: the error text, or the panic text.
+impl fmt::Display for TaskFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Error(failure) => write!(f, "{failure}"),
+            Self::Panic(payload) => write!(f, "panic: {payload}"),
+        }
+    }
 }
 
 /// Handle given to a module instance. Cloning is cheap; all clones belong to
@@ -93,7 +104,9 @@ impl ModuleContext {
     /// Runs `task` in the background under the manager's supervision.
     ///
     /// If the task returns an error or panics, the module fails with
-    /// `Failed { phase: Run }` and its running dependents are blocked. When the
+    /// `Failed { phase: Run }` and its running dependents are blocked. Once
+    /// the application has started to exit, the failure is only logged and
+    /// the module is stopped by the exit like the others. When the
     /// instance stops, the manager waits for its tasks for a limited time and
     /// then aborts the rest. A task started after the stop has begun is not
     /// run. Must be called within the tokio runtime, as all module code is.
@@ -126,14 +139,33 @@ impl ModuleContext {
                 // Aborted by the manager while the instance was stopping.
                 Err(_) => return,
             };
-            if let Some(reports) = reports.upgrade() {
-                // The manager may already be gone; then nothing is left to do.
-                let _ = reports.send(Command::TaskFailed {
-                    id: module,
+            let report = Command::TaskFailed {
+                id: module,
+                instance,
+                task: name,
+                failure,
+            };
+            // The manager closes its queue when the application exits and is
+            // gone after that: then the supervisor logs the failure itself, so
+            // it is never lost silently (D2).
+            let undelivered = match reports.upgrade() {
+                Some(reports) => reports.send(report).err().map(|error| error.0),
+                None => Some(report),
+            };
+            if let Some(Command::TaskFailed {
+                id,
+                instance,
+                task,
+                failure,
+            }) = undelivered
+            {
+                tracing::warn!(
+                    module = %id,
                     instance,
-                    task: name,
-                    failure,
-                });
+                    task,
+                    error = %failure,
+                    "background task failed, but the module manager can no longer be told"
+                );
             }
         });
     }
