@@ -178,9 +178,10 @@ impl ModuleManagerHandle {
     /// Stops all running modules for the application exit, in reverse
     /// dependency order, within `SHUTDOWN_TIMEOUT` counted from this call
     /// (decision 28). Modules left when the time is up are terminated. The
-    /// manager then ends: later commands fail with `ShutDown`, and it
-    /// publishes nothing more, so the event bus can be closed safely. Must be
-    /// called within the tokio runtime: it starts the deadline timer.
+    /// manager then logs its end and only then replies; after the reply it
+    /// logs, publishes and does nothing more, and later commands fail with
+    /// `ShutDown`, so the event bus can be closed safely. Must be called
+    /// within the tokio runtime: it starts the deadline timer.
     pub async fn shutdown(&self) -> Result<StopReport, ManagerError> {
         if !self.shutdown.requested.is_cancelled() {
             self.shutdown.requested.cancel();
@@ -374,11 +375,13 @@ impl Actor {
                 }
                 Command::Shutdown { reply } => {
                     self.exit(reply, &mut commands).await;
-                    break;
+                    // Nothing after the reply: no log, no event, no work (L1).
+                    return;
                 }
             }
         }
-        // Nothing is published after this point.
+        // Every handle is gone and no exit was requested: there is nobody to
+        // reply to. Nothing is published after this point.
         if !self.running.is_empty() {
             tracing::warn!(
                 modules = self.running.len(),
@@ -395,9 +398,15 @@ impl Actor {
         tracing::info!("module manager stopped");
     }
 
-    /// The exit command (decision 28, D2): stop the modules, then close the
-    /// queue and take what is left in it (reports are only logged, commands
-    /// get `ShutDown`), and send the report.
+    /// The exit command (decision 28, D2, L1): stop the modules, take what is
+    /// left in the queue (reports are only logged, commands get `ShutDown`),
+    /// log the end of the manager, and only then send the report. After the
+    /// reply the manager does nothing more.
+    ///
+    /// Order (variant B): the queue is closed only after the end is logged.
+    /// A request that finds the queue closed — e.g. a second exit request from
+    /// `RunEvent::Exit` — fails at once, so it must not be able to fail before
+    /// the end line, or its caller could flush the log before that line.
     async fn exit(
         &mut self,
         reply: oneshot::Sender<StopReport>,
@@ -412,15 +421,35 @@ impl Actor {
             .collect();
         let report = self.shutdown().await;
 
-        // After `close` nothing new arrives: a supervisor whose report cannot
-        // be sent logs it itself. What is already queued is still received.
-        commands.close();
+        // 1. Take what is queued while the queue is still open: requests sent
+        //    meanwhile are queued too and wait for the steps below.
         let mut repeated = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            exit_message(command, &running_at_exit, &mut repeated);
+        }
+        // 2. Log the end.
+        if !self.running.is_empty() {
+            tracing::warn!(
+                modules = self.running.len(),
+                "module manager ended with modules still running"
+            );
+        }
+        tracing::info!("module manager stopped");
+        // 3. Close the queue: from now on a supervisor whose report cannot be
+        //    sent logs it itself, and a new request fails at once — after the
+        //    end line. 4. Take what arrived between step 1 and the close; a
+        //    report found here is logged after the end line, still before the
+        //    reply (the remaining limitation of this order).
+        commands.close();
         while let Some(command) = commands.recv().await {
             exit_message(command, &running_at_exit, &mut repeated);
         }
-        let _ = reply.send(report);
+        // 5. Release the repeated exit requests: their callers get `ShutDown`
+        //    after the end line. 6. Reply; nothing follows.
         drop(repeated);
+        let _ = reply.send(report);
+        #[cfg(test)]
+        test_hooks::after_reply();
     }
 
     async fn apply(
@@ -1138,8 +1167,8 @@ impl Lifecycle {
 /// One message taken from the queue during the exit: nothing is executed.
 /// Reports are only logged, commands get `ShutDown`, the end of a late health
 /// check needs nothing (`shutdown_all` has taken the instance back or
-/// terminated the module), and repeated exit requests get `ShutDown` after
-/// the reply.
+/// terminated the module), and repeated exit requests are kept until the end
+/// is logged.
 fn exit_message(
     command: Command,
     running_at_exit: &BTreeSet<(ModuleId, u64)>,
@@ -1278,5 +1307,29 @@ async fn wait_for<T>(
         // Cancelled from outside, e.g. while the runtime shuts down.
         Some(Ok(Err(_))) | None => Waited::Interrupted(task),
         Some(Err(_elapsed)) => Waited::TimedOut(task),
+    }
+}
+
+/// Test hook (as in `events::bus`): lets a test observe the moment right
+/// after the reply to `Shutdown`, on the manager's thread (test 57).
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::cell::RefCell;
+
+    type AfterReply = Option<Box<dyn FnMut()>>;
+
+    thread_local! {
+        /// Called by the manager on this thread right after it has sent the
+        /// reply to `Shutdown`.
+        pub(in crate::modules) static AFTER_REPLY: RefCell<AfterReply> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_reply() {
+        AFTER_REPLY.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
     }
 }

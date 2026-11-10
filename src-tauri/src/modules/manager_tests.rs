@@ -2148,3 +2148,191 @@ fn messages_arriving_during_shutdown_all_start_nothing() {
     log_line(&logs, "stopping modules: the application is exiting");
     assert!(!logs.contains("Failed { phase: Run"), "{logs}");
 }
+
+/// A waker that logs `marker` when woken. A request polled with it shows in
+/// the manager's log the moment the manager answers or releases it: sending
+/// on or dropping a `oneshot::Sender` wakes the receiver at once, on the
+/// manager's thread.
+struct LogOnWake(&'static str);
+
+impl std::task::Wake for LogOnWake {
+    fn wake(self: Arc<Self>) {
+        tracing::info!(target: "test", "{}", self.0);
+    }
+}
+
+/// Test 72 (D2, L1). A repeated exit request is not run again, and the
+/// manager releases it after it has logged its end and before it answers the
+/// first request: end line → release → reply, as the log of the manager's
+/// thread shows (both requests are polled with marking wakers).
+#[test]
+fn a_repeated_shutdown_is_released_after_the_end_is_logged() {
+    let logs = capture_logs(|| {
+        run(async {
+            let h = harness(&[("t.a", &[])]);
+            h.confirm(ChangeAction::Enable, "t.a").await;
+            h.probe("t.a")
+                .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));
+            let answered = Waker::from(Arc::new(LogOnWake("FIRST EXIT REQUEST ANSWERED")));
+            let released = Waker::from(Arc::new(LogOnWake("REPEATED EXIT REQUEST RELEASED")));
+            let manager = h.manager.clone();
+            let mut first = Box::pin(async move { manager.shutdown().await });
+            assert!(
+                first
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&answered))
+                    .is_pending()
+            );
+            wait_until(|| h.status("t.a").state == ModuleState::Stopping).await;
+            // The repeated request is queued while the modules stop.
+            let manager = h.manager.clone();
+            let mut second = Box::pin(async move { manager.shutdown().await });
+            assert!(
+                second
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&released))
+                    .is_pending()
+            );
+            settle().await;
+            let Poll::Ready(Ok(report)) = first.as_mut().poll(&mut Context::from_waker(&answered))
+            else {
+                panic!("the first request is answered");
+            };
+            assert_eq!(report.stopped, [id("t.a")]);
+            assert_eq!(
+                second.as_mut().poll(&mut Context::from_waker(&released)),
+                Poll::Ready(Err(ManagerError::ShutDown))
+            );
+            assert_eq!(count(&h.probe("t.a").stopped), 1, "shutdown_all ran once");
+        });
+    });
+    log_line(&logs, "stopping modules: the application is exiting");
+    let position = |message: &str| {
+        logs.find(message)
+            .unwrap_or_else(|| panic!("no `{message}` in the log:\n{logs}"))
+    };
+    let end = position("module manager stopped");
+    let released = position("REPEATED EXIT REQUEST RELEASED");
+    let answered = position("FIRST EXIT REQUEST ANSWERED");
+    assert!(end < released, "released only after the end line:\n{logs}");
+    assert!(released < answered, "released before the reply:\n{logs}");
+}
+
+/// Test 78 (variant B). A request that finds the queue already closed fails
+/// at once, so the queue is closed only after the end line. With more than
+/// tokio's cooperative budget (128) of messages queued, a drain with `recv`
+/// after `close` yields in the middle; a request sent then would fail before
+/// the end line. Here such a request, sent as soon as the modules have
+/// stopped, fails only after the end line.
+#[test]
+fn a_request_that_finds_the_queue_closed_fails_after_the_end_is_logged() {
+    let logs = capture_logs(|| {
+        run(async {
+            let h = harness(&[("t.a", &[])]);
+            h.confirm(ChangeAction::Enable, "t.a").await;
+            h.probe("t.a")
+                .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));
+            let first = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move { manager.shutdown().await })
+            };
+            wait_until(|| h.status("t.a").state == ModuleState::Stopping).await;
+            // 200 commands wait in the queue behind the exit.
+            let waiting: Vec<_> = (0..200)
+                .map(|_| {
+                    let manager = h.manager.clone();
+                    tokio::spawn(async move { manager.check_health(id("t.a")).await })
+                })
+                .collect();
+            run_ready_tasks().await;
+            // A late request, woken by the last status change of the exit.
+            let late = {
+                let manager = h.manager.clone();
+                let mut events = h.bus.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        let Received::Event(envelope) = events.recv().await else {
+                            panic!("bus closed");
+                        };
+                        let AppEvent::Module(ModuleEvent::StatusChanged { current, .. }) =
+                            envelope.event
+                        else {
+                            continue;
+                        };
+                        if current.state == ModuleState::Stopped {
+                            break;
+                        }
+                    }
+                    let result = manager.shutdown().await;
+                    tracing::info!(target: "test", "LATE EXIT REQUEST RETURNED");
+                    result
+                })
+            };
+            first.await.expect("task").expect("first shutdown");
+            assert_eq!(late.await.expect("task"), Err(ManagerError::ShutDown));
+            for task in waiting {
+                assert_eq!(task.await.expect("task"), Err(ManagerError::ShutDown));
+            }
+        });
+    });
+    let end = logs.find("module manager stopped").expect("end logged");
+    let late = logs
+        .find("LATE EXIT REQUEST RETURNED")
+        .expect("late request returned");
+    assert!(end < late, "{logs}");
+}
+
+/// Test 57 (L1). The manager logs its end before it replies to `Shutdown`,
+/// and after the reply it neither logs nor publishes anything. A hook right
+/// after the reply marks the moment in the log of the manager's thread, so
+/// the order itself is checked, not only the presence of the line.
+#[test]
+fn the_manager_logs_its_end_before_replying() {
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+            h.confirm(ChangeAction::Enable, "t.b").await;
+            h.probe("t.b")
+                .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));
+            h.changes();
+            manager::test_hooks::AFTER_REPLY.set(Some(Box::new(|| {
+                tracing::info!(target: "test", "AFTER THE REPLY");
+            })));
+            let exiting = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move { manager.shutdown().await })
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // A report that the manager takes from its queue after the stops.
+            assert!(h.probe("t.a").end_background(TaskEnd::Fail));
+            let report = exiting.await.expect("task").expect("shutdown");
+            assert_eq!(report.stopped, [id("t.b"), id("t.a")]);
+            let mut expected = stop_cycle("t.b", true);
+            expected.extend(stop_cycle("t.a", true));
+            assert_eq!(h.changes(), expected);
+            settle().await;
+            assert!(h.events().is_empty(), "nothing published after the reply");
+            manager::test_hooks::AFTER_REPLY.set(None);
+        });
+    });
+    let position = |message: &str| {
+        logs.find(message)
+            .unwrap_or_else(|| panic!("no `{message}` in the log:\n{logs}"))
+    };
+    let report = position("background task failed after the exit request");
+    let stopped = position("module manager stopped");
+    let marker = position("AFTER THE REPLY");
+    assert!(
+        report < stopped,
+        "the queue is taken before the end:\n{logs}"
+    );
+    assert!(
+        stopped < marker,
+        "the end is logged before the reply:\n{logs}"
+    );
+    let after = &logs[marker..];
+    assert!(
+        !after.contains("atlas_lib::modules"),
+        "the manager logs nothing after the reply:\n{after}"
+    );
+}
