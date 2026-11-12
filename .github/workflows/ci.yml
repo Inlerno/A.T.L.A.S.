@@ -51,6 +51,17 @@ jobs:
           cargo --version
           rustup show active-toolchain
 
+      - name: Forbid panic = "abort"
+        shell: bash
+        run: |
+          # Module failure isolation (#9, ADR-014) relies on unwinding: a panic
+          # in a module task is caught only with panic = "unwind".
+          if grep -nE "^[[:space:]]*panic[[:space:]]*=[[:space:]]*[\"']abort[\"']" src-tauri/Cargo.toml; then
+            echo "::error file=src-tauri/Cargo.toml::panic = \"abort\" is forbidden: module failure isolation relies on unwinding (ADR-014)"
+            exit 1
+          fi
+          echo "OK: no panic = \"abort\" in src-tauri/Cargo.toml"
+
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

@@ -28,13 +28,13 @@
 //! of tokio and other common executors only schedule the task and meet this.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use super::types::{AppEvent, EventEnvelope, EventSource};
+use crate::clock::unix_time_ms;
 
 /// Capacity used by the application: events kept for each subscriber.
 pub const DEFAULT_CAPACITY: usize = 256;
@@ -204,16 +204,6 @@ impl Subscriber {
     }
 }
 
-/// Current wall-clock time in Unix milliseconds; 0 if the clock is set before
-/// 1970.
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 /// Interception points that let a test force a particular interleaving of
 /// threads instead of waiting for a race to happen. Compiled only into the
 /// test build: the application has no hooks. A hook is set per thread, so
@@ -322,8 +312,10 @@ mod tests {
 
     /// Module whose status change the envelope reports.
     fn module_of(envelope: &EventEnvelope) -> &ModuleId {
-        let AppEvent::Module(ModuleEvent::StatusChanged { id, .. }) = &envelope.event;
-        id
+        match &envelope.event {
+            AppEvent::Module(ModuleEvent::StatusChanged { id, .. }) => id,
+            other => panic!("expected a status change, got {other:?}"),
+        }
     }
 
     /// Nothing is waiting for the subscriber right now.
@@ -433,7 +425,10 @@ mod tests {
             id: module,
             previous,
             current,
-        }) = envelope.event;
+        }) = envelope.event
+        else {
+            panic!("expected a status change");
+        };
         assert_eq!(module, id("t.a"));
         assert_eq!(previous.state, ModuleState::Running);
         assert_eq!(current, failed);
