@@ -4,7 +4,7 @@
 //! so subscribers match exhaustively and never receive an untyped payload.
 //! A variant is added together with the code that publishes it (decision 5 in
 //! #13): `HealthChanged` with the lifecycle manager (#9), `SettingsChanged`
-//! with settings (#10), the demo event with #12. Events are notifications
+//! and `ManagerReady` with settings (#10), the demo event with #12. Events are notifications
 //! only and never carry secrets.
 
 use crate::modules::contract::{Health, ModuleId, ModuleStatus};
@@ -55,4 +55,17 @@ pub enum ModuleEvent {
     /// for the same running instance. Informational: it never changes the
     /// status (#9).
     HealthChanged { id: ModuleId, health: Health },
+    /// The settings of a module were changed by the user and saved (#10).
+    /// Carries no values: settings may hold user data. `restart_required` —
+    /// the running instance was created with other settings and gets the new
+    /// ones only after a confirmed `restart`; nothing restarts on its own.
+    SettingsChanged {
+        id: ModuleId,
+        restart_required: bool,
+    },
+    /// The manager has loaded the configuration and finished the startup of
+    /// enabled modules, so its snapshot is reliable (#10, ADR-015). Published
+    /// once. It does not promise that the manager still accepts commands: the
+    /// application may already be exiting.
+    ManagerReady,
 }

@@ -144,7 +144,8 @@ mod tests {
     /// A state with a module manager whose actor never runs: these tests do
     /// not send it commands.
     fn state_with(log_guard: Option<WorkerGuard>, events: EventBus) -> AppState {
-        let (modules, _actor) = manager::create(Vec::new(), events.clone());
+        let store = Box::new(crate::modules::config::InMemoryConfigStore::default());
+        let (modules, _actor) = manager::create(Vec::new(), store, events.clone());
         AppState::new(log_guard, events, modules)
     }
 

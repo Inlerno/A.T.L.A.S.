@@ -1,22 +1,29 @@
-//! Module lifecycle manager (issue #9, ADR-014).
+//! Module lifecycle manager (issue #9, ADR-014; configuration and startup:
+//! issue #10, ADR-015).
 //!
-//! An actor: one task owns the registry and handles commands strictly one
-//! after another. It is the only component that changes module statuses and
-//! it keeps the status invariant on every transition (decision 23 in #13).
-//! Mechanisms (decision 26): `mpsc` carries commands to the actor, `oneshot`
-//! carries each result back, `watch` holds a snapshot of the statuses for
-//! reading only, and every change is announced only by `StatusChanged` on the
-//! central event bus.
+//! An actor: one task owns the registry and the module configuration and
+//! handles commands strictly one after another. It is the only component that
+//! changes module statuses and it keeps the status invariant on every
+//! transition (decision 23 in #13). Mechanisms (decision 26): `mpsc` carries
+//! commands to the actor, `oneshot` carries each result back, `watch` holds a
+//! snapshot (statuses, settings, readiness) for reading only, and every change
+//! is announced only on the central event bus.
 //!
-//! Nothing happens on its own: modules start, stop and recover only by a
-//! confirmed command. Failures are isolated: every module call runs in its own
-//! task with a timeout, and a failed module blocks only its dependents.
+//! At startup the actor loads the configuration of every module and starts
+//! the modules the user left enabled; only then is it ready and reads its
+//! command queue. After that nothing happens on its own: modules start, stop
+//! and recover only by a confirmed command. Failures are isolated: every
+//! module call runs in its own task with a timeout, every factory call is
+//! guarded against panics, and a failed module blocks only its dependents.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, WeakUnboundedSender};
 use tokio::sync::{oneshot, watch};
@@ -24,6 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
+use super::config::{ModuleConfig, ModuleConfigStore, check_settings};
 use super::context::{ModuleContext, TaskFailure, panic_text};
 use super::contract::{
     BlockReason, FailurePhase, Health, Module, ModuleError, ModuleFactory, ModuleFailure, ModuleId,
@@ -63,6 +71,12 @@ pub mod text {
     pub const UNRESPONSIVE: &str = "Модуль не отвечает и остановлен без вызова stop";
     pub const HEALTH_NO_ANSWER: &str = "проверка не ответила";
     pub const HEALTH_PANICKED: &str = "проверка завершилась аварийно";
+    pub const CONFIG_UNREADABLE: &str = "Не удалось прочитать конфигурацию модуля";
+    /// Prefix of `Failed { phase: Settings }`, followed by the reason.
+    pub const INVALID_SETTINGS: &str = "Настройки модуля некорректны";
+    pub const VALIDATOR_PANICKED: &str = "проверка настроек завершилась аварийно";
+    pub const DEFAULTS_PANICKED: &str =
+        "значения по умолчанию недоступны: модуль аварийно завершился";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -74,6 +88,76 @@ pub enum ManagerError {
     /// The application is exiting: the manager accepts no more commands.
     #[error("the module manager has shut down")]
     ShutDown,
+    /// The configuration is not loaded yet: the snapshot is not reliable (#10).
+    #[error("the module manager is not ready yet")]
+    NotReady,
+    /// The configuration record of the module could not be read at startup;
+    /// its settings are unknown (#10).
+    #[error("the configuration of module `{0}` could not be read")]
+    ConfigUnavailable(ModuleId),
+    /// The configuration could not be saved; nothing was changed. Details are
+    /// in the log (#10).
+    #[error("the module configuration could not be saved")]
+    Store,
+}
+
+/// Settings of a module as the manager keeps them (#10).
+#[derive(Clone, PartialEq)]
+pub enum SettingsEntry {
+    /// Loaded from the store or the module's defaults. `valid = false`: the
+    /// value failed the checks at startup; an enabled module with such
+    /// settings does not start, a disabled one only has it logged.
+    Loaded { value: Arc<Value>, valid: bool },
+    /// The record could not be read (`ConfigUnavailable`).
+    Unavailable,
+}
+
+/// Without the settings values.
+impl fmt::Debug for SettingsEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Loaded { valid, .. } => f
+                .debug_struct("Loaded")
+                .field("value", &"<hidden>")
+                .field("valid", valid)
+                .finish(),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
+/// What readers see (`watch`, decision 26). Updated by the manager before
+/// every event, so a subscriber that reads it sees at least that change.
+#[derive(Debug, Clone, Default)]
+pub struct ModulesSnapshot {
+    /// The configuration is loaded and the startup of enabled modules has
+    /// finished (or was cut short by the exit): the statuses are reliable.
+    /// Set once, never reset. It does not promise that commands are still
+    /// accepted (ADR-015).
+    pub ready: bool,
+    pub statuses: StatusMap,
+    pub settings: BTreeMap<ModuleId, SettingsEntry>,
+    /// Running modules whose instance was created with other settings.
+    pub restart_required: BTreeSet<ModuleId>,
+}
+
+/// Settings of one module, as `get_settings` returns them.
+#[derive(Clone, PartialEq)]
+pub struct ModuleSettings {
+    pub value: Arc<Value>,
+    pub valid: bool,
+    pub restart_required: bool,
+}
+
+/// Without the settings values.
+impl fmt::Debug for ModuleSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleSettings")
+            .field("value", &"<hidden>")
+            .field("valid", &self.valid)
+            .field("restart_required", &self.restart_required)
+            .finish()
+    }
 }
 
 /// Result of `apply`. Only `Applied` changed anything.
@@ -131,23 +215,72 @@ struct ShutdownSignal {
 #[derive(Clone)]
 pub struct ModuleManagerHandle {
     commands: mpsc::UnboundedSender<Command>,
-    snapshot: watch::Receiver<StatusMap>,
+    snapshot: watch::Receiver<ModulesSnapshot>,
     graph: Arc<ModuleGraph>,
     shutdown: ShutdownSignal,
 }
 
 impl ModuleManagerHandle {
+    /// `true` once the configuration is loaded and the startup has finished:
+    /// from then on the snapshot is reliable (ADR-015). It does not mean the
+    /// manager still accepts commands.
+    pub fn is_ready(&self) -> bool {
+        self.snapshot.borrow().ready
+    }
+
     /// Current statuses of all modules, read from the snapshot without
     /// waiting for the manager. Read-only: changes are announced only by
-    /// `StatusChanged` on the event bus (decision 26).
-    pub fn statuses(&self) -> StatusMap {
-        self.snapshot.borrow().clone()
+    /// `StatusChanged` on the event bus (decision 26). `NotReady` until the
+    /// manager is ready; works also while and after the application exits.
+    pub fn statuses(&self) -> Result<StatusMap, ManagerError> {
+        let snapshot = self.snapshot.borrow();
+        if snapshot.ready {
+            Ok(snapshot.statuses.clone())
+        } else {
+            Err(ManagerError::NotReady)
+        }
     }
 
     /// The plan to show the user before confirmation, computed from the
     /// snapshot. `apply` computes it again from the manager's own statuses.
-    pub fn plan(&self, action: ChangeAction, target: &ModuleId) -> Result<ChangePlan, ModuleError> {
-        plan::plan(&self.graph, &self.statuses(), action, target)
+    pub fn plan(
+        &self,
+        action: ChangeAction,
+        target: &ModuleId,
+    ) -> Result<ChangePlan, ManagerError> {
+        let statuses = self.statuses()?;
+        Ok(plan::plan(&self.graph, &statuses, action, target)?)
+    }
+
+    /// Settings of a module from the snapshot. `NotReady` until the manager
+    /// is ready; `ConfigUnavailable` if the record could not be read.
+    pub fn get_settings(&self, id: &ModuleId) -> Result<ModuleSettings, ManagerError> {
+        let snapshot = self.snapshot.borrow();
+        if !snapshot.ready {
+            return Err(ManagerError::NotReady);
+        }
+        match snapshot.settings.get(id) {
+            None => Err(ModuleError::UnknownModule(id.clone()).into()),
+            Some(SettingsEntry::Unavailable) => Err(ManagerError::ConfigUnavailable(id.clone())),
+            Some(SettingsEntry::Loaded { value, valid }) => Ok(ModuleSettings {
+                value: Arc::clone(value),
+                valid: *valid,
+                restart_required: snapshot.restart_required.contains(id),
+            }),
+        }
+    }
+
+    /// Checks and saves new settings of a module. They apply to the next
+    /// instance: a running module is marked `restart_required` and is not
+    /// restarted (only a confirmed `restart` does that). On any error nothing
+    /// changes.
+    pub async fn update_settings(&self, id: ModuleId, settings: Value) -> Result<(), ManagerError> {
+        self.request(|reply| Command::UpdateSettings {
+            id,
+            settings,
+            reply,
+        })
+        .await?
     }
 
     /// Applies `action` to `target` if `verify` approves `confirmation` for
@@ -206,15 +339,18 @@ impl ModuleManagerHandle {
     }
 }
 
-/// Creates the manager for `catalog`. Returns the handle and the actor; the
-/// caller runs the actor on its runtime (`tauri::async_runtime::spawn` in the
-/// application, a test runtime in tests). No module starts here: all are
-/// disabled and stopped (autostart is #10).
+/// Creates the manager for `catalog` with the configuration in `store`.
+/// Returns the handle and the actor; the caller runs the actor on its runtime
+/// (`tauri::async_runtime::spawn` in the application, a test runtime in
+/// tests). The handle is usable at once — the exit works also while the actor
+/// prepares. The actor first loads the configuration and starts the enabled
+/// modules, then becomes ready (ADR-015).
 ///
 /// An invalid catalog is a programming error caught by tests; if it happens
 /// anyway, it is logged and the application runs without modules.
 pub fn create(
     catalog: Vec<Box<dyn ModuleFactory>>,
+    store: Box<dyn ModuleConfigStore>,
     events: EventBus,
 ) -> (
     ModuleManagerHandle,
@@ -236,18 +372,33 @@ pub fn create(
         }
     };
     let graph = Arc::new(graph);
+    // Before the configuration is loaded the user's decision is unknown.
     let statuses: StatusMap = graph
         .start_order()
         .iter()
-        .map(|id| (id.clone(), ModuleStatus::default()))
+        .map(|id| {
+            let status = ModuleStatus {
+                enabled: None,
+                state: ModuleState::Stopped,
+            };
+            (id.clone(), status)
+        })
         .collect();
-    let (snapshot_tx, snapshot_rx) = watch::channel(statuses.clone());
+    let (snapshot_tx, snapshot_rx) = watch::channel(ModulesSnapshot {
+        statuses: statuses.clone(),
+        ..ModulesSnapshot::default()
+    });
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let shutdown = ShutdownSignal::default();
     let actor = Actor {
         graph: Arc::clone(&graph),
         factories,
+        store,
         statuses,
+        settings: BTreeMap::new(),
+        problems: BTreeMap::new(),
+        exiting: false,
+        stopping_all: false,
         running: BTreeMap::new(),
         health: BTreeMap::new(),
         snapshot: snapshot_tx,
@@ -277,6 +428,11 @@ pub(super) enum Command {
     CheckHealth {
         id: ModuleId,
         reply: oneshot::Sender<Result<Health, ManagerError>>,
+    },
+    UpdateSettings {
+        id: ModuleId,
+        settings: Value,
+        reply: oneshot::Sender<Result<(), ManagerError>>,
     },
     Shutdown {
         reply: oneshot::Sender<StopReport>,
@@ -313,13 +469,24 @@ enum Slot {
 struct Actor {
     graph: Arc<ModuleGraph>,
     factories: BTreeMap<ModuleId, Box<dyn ModuleFactory>>,
+    /// Read once at startup; afterwards only written, one batch per command.
+    store: Box<dyn ModuleConfigStore>,
     /// Authoritative statuses; the snapshot is a copy for readers.
     statuses: StatusMap,
+    /// Settings of each loaded module (#10).
+    settings: BTreeMap<ModuleId, SettingsEntry>,
+    /// Why the settings of a module are invalid (`valid = false`); the text
+    /// names the problem, never the value.
+    problems: BTreeMap<ModuleId, String>,
+    /// In exit mode: from now on only `shutdown_all` changes statuses (И7).
+    exiting: bool,
+    /// `shutdown_all` is running.
+    stopping_all: bool,
     /// Instances of the modules in `Running`, and only of those.
     running: BTreeMap<ModuleId, Instance>,
     /// Last health result of each running instance.
     health: BTreeMap<ModuleId, Health>,
-    snapshot: watch::Sender<StatusMap>,
+    snapshot: watch::Sender<ModulesSnapshot>,
     events: EventBus,
     /// Given to module contexts for failure reports. Weak: modules do not
     /// keep the manager alive.
@@ -349,39 +516,71 @@ struct CallFailure {
 impl Actor {
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         tracing::info!(modules = self.statuses.len(), "module manager started");
-        while let Some(command) = commands.recv().await {
-            match command {
-                Command::Apply {
-                    action,
-                    target,
-                    confirmation,
-                    reply,
-                } => {
-                    let outcome = self.apply(action, &target, &confirmation).await;
-                    let _ = reply.send(outcome);
-                }
-                Command::CheckHealth { id, reply } => {
-                    let health = self.check_health(&id).await;
-                    let _ = reply.send(health);
-                }
-                Command::TaskFailed {
-                    id,
-                    instance,
-                    task,
-                    failure,
-                } => self.task_failed(&id, instance, task, failure).await,
-                Command::HealthCheckEnded { id, instance } => {
-                    self.health_check_ended(&id, instance).await;
-                }
-                Command::Shutdown { reply } => {
-                    self.exit(reply, &mut commands).await;
-                    // Nothing after the reply: no log, no event, no work (L1).
+        // Preparation: the queue is not read; commands sent meanwhile wait and
+        // run afterwards, in order (П10).
+        self.prepare().await;
+        let requested = self.shutdown.requested.clone();
+        let pending = loop {
+            // The exit signal comes before queued work (Р6).
+            let command = match requested.run_until_cancelled(commands.recv()).await {
+                None => break None,
+                Some(Some(command)) => command,
+                Some(None) => {
+                    self.end_without_exit();
                     return;
                 }
+            };
+            // A message received together with the exit request, or the exit
+            // command itself, is not executed: the exit rules apply to it.
+            if requested.is_cancelled() || matches!(command, Command::Shutdown { .. }) {
+                break Some(command);
             }
+            self.handle(command).await;
+        };
+        self.exit(pending, &mut commands).await;
+        // Nothing after the reply: no log, no event, no work (L1).
+    }
+
+    async fn handle(&mut self, command: Command) {
+        match command {
+            Command::Apply {
+                action,
+                target,
+                confirmation,
+                reply,
+            } => {
+                let outcome = self.apply(action, &target, &confirmation).await;
+                let _ = reply.send(outcome);
+            }
+            Command::CheckHealth { id, reply } => {
+                let health = self.check_health(&id).await;
+                let _ = reply.send(health);
+            }
+            Command::UpdateSettings {
+                id,
+                settings,
+                reply,
+            } => {
+                let result = self.update_settings(&id, settings).await;
+                let _ = reply.send(result);
+            }
+            Command::TaskFailed {
+                id,
+                instance,
+                task,
+                failure,
+            } => self.task_failed(&id, instance, task, failure).await,
+            Command::HealthCheckEnded { id, instance } => {
+                self.health_check_ended(&id, instance).await;
+            }
+            // Taken by the loop in `run`.
+            Command::Shutdown { reply } => drop(reply),
         }
-        // Every handle is gone and no exit was requested: there is nobody to
-        // reply to. Nothing is published after this point.
+    }
+
+    /// Every handle is gone and no exit was requested: there is nobody to
+    /// reply to. Nothing is published after this point.
+    fn end_without_exit(&mut self) {
         if !self.running.is_empty() {
             tracing::warn!(
                 modules = self.running.len(),
@@ -398,10 +597,217 @@ impl Actor {
         tracing::info!("module manager stopped");
     }
 
-    /// The exit command (decision 28, D2, L1): stop the modules, take what is
-    /// left in the queue (reports are only logged, commands get `ShutDown`),
-    /// log the end of the manager, and only then send the report. After the
-    /// reply the manager does nothing more.
+    /// Loads the configuration and starts the enabled modules, then marks the
+    /// snapshot ready and publishes `ManagerReady` once (ADR-015). An exit
+    /// during the loading leaves the manager not ready for good; an exit
+    /// during the startup lets the operation in progress end (an interrupted
+    /// start fails, as in MM-4) and the manager becomes ready before
+    /// `shutdown_all` begins.
+    async fn prepare(&mut self) {
+        if !self.load().await {
+            return;
+        }
+        self.autostart().await;
+        self.snapshot.send_modify(|snapshot| snapshot.ready = true);
+        tracing::info!("module manager ready");
+        self.publish(ModuleEvent::ManagerReady);
+    }
+
+    /// Reads the record of every module, in start order, each read waited for
+    /// only until the exit is requested. Returns `false` if the exit cut the
+    /// loading short: the modules not read stay `{ None, Stopped }`.
+    async fn load(&mut self) -> bool {
+        let requested = self.shutdown.requested.clone();
+        let (mut stored, mut defaults, mut unavailable) = (0usize, 0usize, 0usize);
+        for id in self.graph.start_order().to_vec() {
+            let Some(loaded) = requested.run_until_cancelled(self.store.load(&id)).await else {
+                tracing::warn!(module = %id, "configuration loading interrupted: the application is exiting");
+                return false;
+            };
+            match loaded {
+                Ok(Some(ModuleConfig { enabled, settings })) => {
+                    stored += 1;
+                    let problem = self.validate(&id, &settings).err();
+                    self.adopt(&id, enabled, settings, problem);
+                }
+                Ok(None) => {
+                    defaults += 1;
+                    let enabled = self
+                        .graph
+                        .descriptor(&id)
+                        .is_some_and(|descriptor| descriptor.default_enabled);
+                    let (settings, problem) = self.default_settings(&id);
+                    let problem = problem.or_else(|| self.validate(&id, &settings).err());
+                    self.adopt(&id, enabled, settings, problem);
+                }
+                Err(error) => {
+                    unavailable += 1;
+                    // Details of the store go to the log only. The record is
+                    // neither replaced by defaults nor written.
+                    tracing::error!(module = %id, %error, "module configuration could not be read: the module does not start");
+                    self.settings.insert(id.clone(), SettingsEntry::Unavailable);
+                    let state = ModuleState::ConfigUnavailable {
+                        error: text::CONFIG_UNREADABLE.to_owned(),
+                        at: unix_time_ms(),
+                    };
+                    self.set_status(
+                        &id,
+                        ModuleStatus {
+                            enabled: None,
+                            state,
+                        },
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            modules = self.statuses.len(),
+            stored,
+            defaults,
+            unavailable,
+            "module configuration loaded"
+        );
+        true
+    }
+
+    /// Takes a loaded decision and settings: one `StatusChanged` from
+    /// `{ None, Stopped }`, no `SettingsChanged`. Invalid settings of a
+    /// disabled module are only logged (it never fails); those of an enabled
+    /// one fail it at startup.
+    fn adopt(&mut self, id: &ModuleId, enabled: bool, settings: Value, problem: Option<String>) {
+        if let Some(reason) = &problem {
+            if enabled {
+                tracing::error!(module = %id, %reason, "settings of an enabled module are invalid");
+            } else {
+                tracing::error!(module = %id, %reason, "settings of a disabled module are invalid");
+            }
+        }
+        let valid = problem.is_none();
+        match problem {
+            Some(reason) => self.problems.insert(id.clone(), reason),
+            None => self.problems.remove(id),
+        };
+        let value = Arc::new(settings);
+        self.settings
+            .insert(id.clone(), SettingsEntry::Loaded { value, valid });
+        self.set_status(
+            id,
+            ModuleStatus {
+                enabled: Some(enabled),
+                state: ModuleState::Stopped,
+            },
+        );
+    }
+
+    /// Starts the modules the user left enabled, in dependency order. A
+    /// module whose dependency is disabled, unreadable or failed is blocked by
+    /// the first such dependency in start order (П8); nothing is enabled
+    /// implicitly and nothing is retried. The exit stops the startup before
+    /// the next module.
+    async fn autostart(&mut self) {
+        let (mut started, mut failures, mut blocked) = (0usize, 0usize, 0usize);
+        let mut interrupted = false;
+        for id in self.graph.start_order().to_vec() {
+            if self.statuses.get(&id).and_then(|status| status.enabled) != Some(true) {
+                continue;
+            }
+            if self.shutdown.requested.is_cancelled() {
+                interrupted = true;
+                break;
+            }
+            if let Some((by, reason)) = self.startup_blocker(&id) {
+                self.set_state(&id, ModuleState::Blocked { by, reason });
+                blocked += 1;
+                continue;
+            }
+            if let Some(reason) = self.problems.get(&id).cloned() {
+                let error = format!("{}: {reason}", text::INVALID_SETTINGS);
+                self.set_state(&id, failed(FailurePhase::Settings, &error));
+                failures += 1;
+                continue;
+            }
+            match self.start(&id).await {
+                Ok(()) => started += 1,
+                Err(_) => failures += 1,
+            }
+        }
+        let interrupted = interrupted || self.shutdown.requested.is_cancelled();
+        tracing::info!(
+            started,
+            failed = failures,
+            blocked,
+            interrupted,
+            "autostart finished"
+        );
+    }
+
+    /// The first dependency, in start order, that keeps `id` from starting:
+    /// disabled, unreadable or failed. A blocked dependency passes on its own
+    /// root cause.
+    fn startup_blocker(&self, id: &ModuleId) -> Option<(ModuleId, BlockReason)> {
+        let dependencies = self.graph.transitive_dependencies(id);
+        self.graph
+            .start_order()
+            .iter()
+            .filter(|module| dependencies.contains(*module))
+            .find_map(|module| {
+                let status = self.statuses.get(module)?;
+                match (&status.state, status.enabled) {
+                    (ModuleState::ConfigUnavailable { .. }, _) | (_, None) => {
+                        Some((module.clone(), BlockReason::DependencyConfigUnavailable))
+                    }
+                    (_, Some(false)) => Some((module.clone(), BlockReason::DependencyDisabled)),
+                    (ModuleState::Failed { .. }, _) => {
+                        Some((module.clone(), BlockReason::DependencyFailed))
+                    }
+                    (ModuleState::Blocked { by, reason }, _) => Some((by.clone(), *reason)),
+                    _ => None,
+                }
+            })
+    }
+
+    /// The module's default settings, guarded against a panic: a panic makes
+    /// the defaults invalid (an empty object is kept as the value).
+    fn default_settings(&self, id: &ModuleId) -> (Value, Option<String>) {
+        let Some(factory) = self.factories.get(id) else {
+            return (empty_settings(), None);
+        };
+        match catch_unwind(AssertUnwindSafe(|| factory.default_settings())) {
+            Ok(settings) => (settings, None),
+            Err(payload) => {
+                tracing::error!(module = %id, panic = %panic_text(payload), "default_settings panicked");
+                (empty_settings(), Some(text::DEFAULTS_PANICKED.to_owned()))
+            }
+        }
+    }
+
+    /// The common checks, then the module's own validator guarded against a
+    /// panic. The error names the problem, never the value.
+    fn validate(&self, id: &ModuleId, settings: &Value) -> Result<(), String> {
+        check_settings(settings).map_err(|problem| problem.to_string())?;
+        let Some(factory) = self.factories.get(id) else {
+            return Ok(());
+        };
+        match catch_unwind(AssertUnwindSafe(|| factory.validate_settings(settings))) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(failure)) => Err(failure.message().to_owned()),
+            Err(payload) => {
+                tracing::error!(module = %id, panic = %panic_text(payload), "validate_settings panicked");
+                Err(text::VALIDATOR_PANICKED.to_owned())
+            }
+        }
+    }
+
+    /// The exit (decision 28, ADR-015 exit mode). The operation in progress
+    /// has ended; from here only `shutdown_all` changes statuses (И7):
+    /// 1. the messages already queued are taken without waiting — commands
+    ///    get `ShutDown`, failure reports are only logged;
+    /// 2. `shutdown_all`;
+    /// 3. if the exit command has not arrived yet, wait for it;
+    /// 4. take what is queued, log the end of the manager, close the queue,
+    ///    take the rest;
+    /// 5. release repeated exit requests, then reply to the first. After the
+    ///    reply the manager does nothing more.
     ///
     /// Order (variant B): the queue is closed only after the end is logged.
     /// A request that finds the queue closed — e.g. a second exit request from
@@ -409,9 +815,10 @@ impl Actor {
     /// the end line, or its caller could flush the log before that line.
     async fn exit(
         &mut self,
-        reply: oneshot::Sender<StopReport>,
+        pending: Option<Command>,
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) {
+        self.exiting = true;
         // Instances running when the exit began, to choose the log level of
         // their late reports.
         let running_at_exit: BTreeSet<(ModuleId, u64)> = self
@@ -419,15 +826,39 @@ impl Actor {
             .iter()
             .map(|(id, instance)| (id.clone(), instance.context.instance()))
             .collect();
-        let report = self.shutdown().await;
-
-        // 1. Take what is queued while the queue is still open: requests sent
-        //    meanwhile are queued too and wait for the steps below.
+        let mut first = None;
         let mut repeated = Vec::new();
-        while let Ok(command) = commands.try_recv() {
-            exit_message(command, &running_at_exit, &mut repeated);
+        let take = |command, first: &mut Option<_>, repeated: &mut Vec<_>| {
+            exit_message(command, &running_at_exit, first, repeated);
+        };
+        // 1. What is already queued.
+        if let Some(command) = pending {
+            take(command, &mut first, &mut repeated);
         }
-        // 2. Log the end.
+        while let Ok(command) = commands.try_recv() {
+            take(command, &mut first, &mut repeated);
+        }
+        // 2. Stop the modules.
+        self.stopping_all = true;
+        let report = self.shutdown().await;
+        self.stopping_all = false;
+        // 3. The exit command is sent together with the exit request, so this
+        //    wait is short. `None`: every handle is gone, nobody to reply to.
+        while first.is_none() {
+            match commands.recv().await {
+                Some(command) => take(command, &mut first, &mut repeated),
+                None => break,
+            }
+        }
+        // 4. Take what is queued while the queue is still open, log the end,
+        //    then close the queue: from now on a supervisor whose report
+        //    cannot be sent logs it itself, and a new request fails at once —
+        //    after the end line. What arrived between the steps is taken
+        //    after the end line, still before the reply (the remaining
+        //    limitation of this order).
+        while let Ok(command) = commands.try_recv() {
+            take(command, &mut first, &mut repeated);
+        }
         if !self.running.is_empty() {
             tracing::warn!(
                 modules = self.running.len(),
@@ -435,19 +866,16 @@ impl Actor {
             );
         }
         tracing::info!("module manager stopped");
-        // 3. Close the queue: from now on a supervisor whose report cannot be
-        //    sent logs it itself, and a new request fails at once — after the
-        //    end line. 4. Take what arrived between step 1 and the close; a
-        //    report found here is logged after the end line, still before the
-        //    reply (the remaining limitation of this order).
         commands.close();
         while let Some(command) = commands.recv().await {
-            exit_message(command, &running_at_exit, &mut repeated);
+            take(command, &mut first, &mut repeated);
         }
         // 5. Release the repeated exit requests: their callers get `ShutDown`
-        //    after the end line. 6. Reply; nothing follows.
+        //    after the end line. Then reply; nothing follows.
         drop(repeated);
-        let _ = reply.send(report);
+        if let Some(reply) = first {
+            let _ = reply.send(report);
+        }
         #[cfg(test)]
         test_hooks::after_reply();
     }
@@ -463,11 +891,142 @@ impl Actor {
         }
         let plan = plan::plan(&self.graph, &self.statuses, action, target)?;
         Ok(match plan::verify(plan.clone(), confirmation) {
-            Verification::Approved => ApplyOutcome::Applied(self.execute(&plan).await),
+            Verification::Approved => {
+                // Checks first, then the decisions are saved as one batch, and
+                // only after that anything changes (ADR-015).
+                self.check_plan_settings(&plan)?;
+                self.save_decisions(&plan).await?;
+                ApplyOutcome::Applied(self.execute(&plan).await)
+            }
             Verification::NotApplicable(plan) => ApplyOutcome::NotApplicable(plan),
             Verification::ConfirmationRequired(plan) => ApplyOutcome::ConfirmationRequired(plan),
             Verification::ImpactChanged(plan) => ApplyOutcome::ImpactChanged(plan),
         })
+    }
+
+    /// A plan that would start a module whose settings are invalid is refused
+    /// up front: nothing is saved or changed.
+    fn check_plan_settings(&self, plan: &ChangePlan) -> Result<(), ModuleError> {
+        for step in &plan.steps {
+            if let PlanStep::Start(id) = step
+                && let Some(reason) = self.problems.get(id)
+            {
+                return Err(ModuleError::InvalidSettings {
+                    module: id.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves the user's decisions of a plan (`Enable`/`Disable` steps) as one
+    /// atomic batch, with the current settings as they are. A plan without
+    /// such steps (`restart`, most `recover`s) writes nothing.
+    async fn save_decisions(&mut self, plan: &ChangePlan) -> Result<(), ManagerError> {
+        let mut batch = Vec::new();
+        for step in &plan.steps {
+            let (id, enabled) = match step {
+                PlanStep::Enable(id) => (id, true),
+                PlanStep::Disable(id) => (id, false),
+                PlanStep::Start(_) | PlanStep::Stop(_) => continue,
+            };
+            match self.settings.get(id) {
+                Some(SettingsEntry::Loaded { value, .. }) => batch.push((
+                    id.clone(),
+                    ModuleConfig {
+                        enabled,
+                        settings: Value::clone(value),
+                    },
+                )),
+                // Unreachable: plans leave out modules with an unknown
+                // decision. Never write over a record that was not read.
+                _ => {
+                    tracing::error!(module = %id, "a plan step for a module without loaded configuration was not saved");
+                }
+            }
+        }
+        self.save(&batch).await
+    }
+
+    /// One atomic write, waited for until the exit deadline. On an error or
+    /// at the deadline nothing in memory changes.
+    async fn save(&self, batch: &[(ModuleId, ModuleConfig)]) -> Result<(), ManagerError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let modules: Vec<&str> = batch.iter().map(|(id, _)| id.as_str()).collect();
+        match self
+            .shutdown
+            .expired
+            .run_until_cancelled(self.store.save_batch(batch))
+            .await
+        {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => {
+                tracing::error!(modules = %modules.join(", "), %error, "module configuration not saved: nothing changed");
+                Err(ManagerError::Store)
+            }
+            None => {
+                tracing::error!(modules = %modules.join(", "), "module configuration not saved before the exit deadline: nothing changed");
+                Err(ManagerError::Store)
+            }
+        }
+    }
+
+    /// `update_settings` (ADR-015): refused after the exit request, for an
+    /// unknown module and for one whose record could not be read; then the
+    /// checks, then one write, and only after it the snapshot and
+    /// `SettingsChanged`. The same value again changes nothing.
+    async fn update_settings(
+        &mut self,
+        id: &ModuleId,
+        settings: Value,
+    ) -> Result<(), ManagerError> {
+        if self.shutdown.requested.is_cancelled() {
+            return Err(ManagerError::ShutDown);
+        }
+        if !self.graph.contains(id) {
+            return Err(ModuleError::UnknownModule(id.clone()).into());
+        }
+        let enabled = self.statuses.get(id).and_then(|status| status.enabled);
+        let (
+            Some(enabled),
+            Some(SettingsEntry::Loaded {
+                value: current,
+                valid,
+            }),
+        ) = (enabled, self.settings.get(id))
+        else {
+            return Err(ManagerError::ConfigUnavailable(id.clone()));
+        };
+        if let Err(reason) = self.validate(id, &settings) {
+            tracing::warn!(module = %id, %reason, "module settings rejected");
+            return Err(ModuleError::InvalidSettings {
+                module: id.clone(),
+                reason,
+            }
+            .into());
+        }
+        if *valid && **current == settings {
+            return Ok(());
+        }
+        let config = ModuleConfig {
+            enabled,
+            settings: settings.clone(),
+        };
+        self.save(&[(id.clone(), config)]).await?;
+        self.problems.remove(id);
+        let value = Arc::new(settings);
+        self.settings
+            .insert(id.clone(), SettingsEntry::Loaded { value, valid: true });
+        let restart_required = self.refresh(id);
+        tracing::info!(module = %id, restart_required, "module settings updated");
+        self.publish(ModuleEvent::SettingsChanged {
+            id: id.clone(),
+            restart_required,
+        });
+        Ok(())
     }
 
     async fn execute(&mut self, plan: &ChangePlan) -> ApplyReport {
@@ -503,7 +1062,7 @@ impl Actor {
                     self.set_status(
                         id,
                         ModuleStatus {
-                            enabled: false,
+                            enabled: Some(false),
                             state,
                         },
                     );
@@ -562,6 +1121,18 @@ impl Actor {
     /// the module ends up `Failed` with the phase, and whatever the instance
     /// spawned is cancelled and aborted.
     async fn start(&mut self, id: &ModuleId) -> Result<(), String> {
+        let Some(SettingsEntry::Loaded {
+            value: settings, ..
+        }) = self.settings.get(id)
+        else {
+            // Unreachable: plans and the startup never start a module whose
+            // configuration was not loaded.
+            tracing::error!(module = %id, "no settings for module");
+            let error = text::CONFIG_UNREADABLE.to_owned();
+            self.set_state(id, failed(FailurePhase::Settings, &error));
+            return Err(error);
+        };
+        let settings = Arc::clone(settings);
         let Some(factory) = self.factories.get(id) else {
             // Unreachable: the graph is built from the factories.
             tracing::error!(module = %id, "no factory for module");
@@ -569,11 +1140,21 @@ impl Actor {
             self.set_state(id, failed(FailurePhase::Initialize, &error));
             return Err(error);
         };
-        let module = factory.create();
+        // `create` runs on the manager task: guarded against a panic (В6).
+        let module = match catch_unwind(AssertUnwindSafe(|| factory.create())) {
+            Ok(module) => module,
+            Err(payload) => {
+                tracing::error!(module = %id, call = "create", panic = %panic_text(payload), "module call panicked");
+                let error = text::PANICKED.to_owned();
+                self.set_state(id, failed(FailurePhase::Initialize, &error));
+                return Err(error);
+            }
+        };
         self.next_instance += 1;
         let context = ModuleContext::new(
             id.clone(),
             self.next_instance,
+            settings,
             self.events.clone(),
             self.reports.clone(),
         );
@@ -885,7 +1466,19 @@ impl Actor {
             .into_iter()
             .filter(|module| self.running.contains_key(module))
             .collect();
-        for id in self.graph.in_shutdown_order(&dependents) {
+        let order = self.graph.in_shutdown_order(&dependents);
+        for (index, id) in order.iter().enumerate() {
+            // A safe point between two stops (И4): after the exit request the
+            // dependents left are stopped by `shutdown_all`, not blocked.
+            if self.shutdown.requested.is_cancelled() {
+                tracing::warn!(
+                    module = %root,
+                    dependents = order.len() - index,
+                    "failure handling interrupted: the application is exiting; the remaining dependents are stopped by the exit"
+                );
+                return;
+            }
+            let id = id.clone();
             let blocked = ModuleState::Blocked {
                 by: root.clone(),
                 reason: BlockReason::DependencyFailed,
@@ -1097,12 +1690,48 @@ impl Actor {
 
     fn set_enabled(&mut self, id: &ModuleId, enabled: bool) {
         let state = self.state(id);
+        let enabled = Some(enabled);
         self.set_status(id, ModuleStatus { enabled, state });
     }
 
     fn set_state(&mut self, id: &ModuleId, state: ModuleState) {
-        let enabled = self.statuses.get(id).is_some_and(|status| status.enabled);
+        let enabled = self.statuses.get(id).and_then(|status| status.enabled);
         self.set_status(id, ModuleStatus { enabled, state });
+    }
+
+    /// Recomputes `restart_required` of `id` and copies its status, settings
+    /// and flag into the snapshot. Returns the flag.
+    fn refresh(&mut self, id: &ModuleId) -> bool {
+        let restart_required = self.restart_needed(id);
+        let status = self.statuses.get(id).cloned();
+        let settings = self.settings.get(id).cloned();
+        self.snapshot.send_modify(|snapshot| {
+            if let Some(status) = status {
+                snapshot.statuses.insert(id.clone(), status);
+            }
+            if let Some(settings) = settings {
+                snapshot.settings.insert(id.clone(), settings);
+            }
+            if restart_required {
+                snapshot.restart_required.insert(id.clone());
+            } else {
+                snapshot.restart_required.remove(id);
+            }
+        });
+        restart_required
+    }
+
+    /// A running instance created with other settings than the current ones.
+    fn restart_needed(&self, id: &ModuleId) -> bool {
+        if self.state(id) != ModuleState::Running {
+            return false;
+        }
+        let (Some(instance), Some(SettingsEntry::Loaded { value, .. })) =
+            (self.running.get(id), self.settings.get(id))
+        else {
+            return false;
+        };
+        instance.context.settings_arc().as_ref() != value.as_ref()
     }
 
     /// The only place where a status changes: the registry and the snapshot
@@ -1120,11 +1749,14 @@ impl Actor {
             current.is_consistent(),
             "inconsistent status of module `{id}`: {current:?}"
         );
+        // In exit mode only `shutdown_all` changes statuses (И7).
+        debug_assert!(
+            !self.exiting || self.stopping_all,
+            "status of module `{id}` changed in exit mode outside shutdown_all"
+        );
         self.statuses.insert(id.clone(), current.clone());
-        self.snapshot.send_modify(|snapshot| {
-            snapshot.insert(id.clone(), current.clone());
-        });
-        tracing::info!(module = %id, enabled = current.enabled, state = ?current.state, "module status changed");
+        self.refresh(id);
+        tracing::info!(module = %id, enabled = ?current.enabled, state = ?current.state, "module status changed");
         self.publish(ModuleEvent::StatusChanged {
             id: id.clone(),
             previous,
@@ -1172,13 +1804,20 @@ impl Lifecycle {
 fn exit_message(
     command: Command,
     running_at_exit: &BTreeSet<(ModuleId, u64)>,
+    first: &mut Option<oneshot::Sender<StopReport>>,
     repeated: &mut Vec<oneshot::Sender<StopReport>>,
 ) {
     match command {
-        Command::Apply { reply, .. } => {
+        Command::Apply { target, reply, .. } => {
+            tracing::debug!(module = %target, "command refused: the application is exiting");
             let _ = reply.send(Err(ManagerError::ShutDown));
         }
-        Command::CheckHealth { reply, .. } => {
+        Command::CheckHealth { id, reply } => {
+            tracing::debug!(module = %id, "health check refused: the application is exiting");
+            let _ = reply.send(Err(ManagerError::ShutDown));
+        }
+        Command::UpdateSettings { id, reply, .. } => {
+            tracing::debug!(module = %id, "settings update refused: the application is exiting");
             let _ = reply.send(Err(ManagerError::ShutDown));
         }
         Command::TaskFailed {
@@ -1191,8 +1830,15 @@ fn exit_message(
             log_exit_report(&id, instance, task, &failure, running);
         }
         Command::HealthCheckEnded { .. } => {}
-        Command::Shutdown { reply } => repeated.push(reply),
+        Command::Shutdown { reply } => match first {
+            None => *first = Some(reply),
+            Some(_) => repeated.push(reply),
+        },
     }
+}
+
+fn empty_settings() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 /// A background task failure reported after the exit request: only logged

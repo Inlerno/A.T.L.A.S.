@@ -41,8 +41,13 @@ pub fn run() {
             logging::install_panic_hook();
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "ATLAS starting");
             let events = EventBus::new(DEFAULT_CAPACITY);
-            // No module starts here: all are disabled (autostart is #10).
-            let (modules, manager) = modules::manager::create(modules::catalog(), events.clone());
+            // The manager loads the module configuration and starts the
+            // enabled modules on its own task (#10, ADR-015). The store keeps
+            // the configuration in memory for this run; persistence between
+            // runs arrives with MM-5B.
+            let store = Box::new(modules::config::InMemoryConfigStore::default());
+            let (modules, manager) =
+                modules::manager::create(modules::catalog(), store, events.clone());
             tauri::async_runtime::spawn(manager);
             app.manage(AppState::new(log_guard, events, modules));
             Ok(())
