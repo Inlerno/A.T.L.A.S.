@@ -118,7 +118,9 @@ pub fn plan(
     let applicable = match (action, status.enabled) {
         // The user's decision is unknown: nothing applies (#10).
         (_, None) => false,
-        (ChangeAction::Enable, Some(enabled)) => !enabled,
+        // Only a disabled, stopped module: a disabled module whose stop failed
+        // (`Failed { Stop }`) leaves that state only by a confirmed `recover`.
+        (ChangeAction::Enable, Some(enabled)) => !enabled && status.state == ModuleState::Stopped,
         (ChangeAction::Disable, Some(enabled)) => enabled,
         (ChangeAction::Recover, Some(_)) => matches!(
             status.state,
@@ -252,10 +254,11 @@ impl Builder {
     }
 
     /// Ensures every transitive dependency of `target` will be running:
-    /// disabled ones are enabled and started (affected), enabled-but-stopped
-    /// ones are started (affected), running ones are kept, and anything else
-    /// (`Failed`, `Blocked`, `ConfigUnavailable`, in transition) blocks the
-    /// plan.
+    /// disabled and stopped ones are enabled and started (affected),
+    /// enabled-but-stopped ones are started (affected), running ones are kept,
+    /// and anything else (`Failed`, `Blocked`, `ConfigUnavailable`, in
+    /// transition) blocks the plan, whatever the user's decision: such a
+    /// dependency is never recovered implicitly (ADR-012).
     fn bring_up_dependencies(
         &mut self,
         graph: &ModuleGraph,
@@ -265,14 +268,15 @@ impl Builder {
         let dependencies = graph.transitive_dependencies(target);
         for module in graph.in_start_order(&dependencies) {
             let status = status_of(statuses, &module);
-            if status.enabled == Some(false) {
+            if status.enabled == Some(false) && status.state == ModuleState::Stopped {
                 self.step(PlanStep::Enable(module.clone()));
                 self.step(PlanStep::Start(module.clone()));
                 self.affected.insert(module.clone());
                 self.restored.insert(module.clone());
                 self.ready.insert(module);
-            } else if status.enabled.is_none() {
-                // Unknown decision: never enabled or started implicitly.
+            } else if status.enabled != Some(true) {
+                // Unknown decision, or disabled but not stopped (e.g. a failed
+                // stop): never enabled or started implicitly.
                 self.blockers.push(Blocker {
                     id: module,
                     state: status.state,
@@ -1004,5 +1008,115 @@ mod tests {
         assert_eq!(restart.affected, ids(&["t.c"]));
         assert!(!starts(&restart).contains(&id("t.b")));
         assert!(!stops(&restart).contains(&id("t.b")));
+    }
+
+    // ---- no implicit recovery of a disabled dependency (#10 review) ----
+
+    fn disabled(state: ModuleState) -> ModuleStatus {
+        ModuleStatus {
+            enabled: Some(false),
+            state,
+        }
+    }
+
+    fn failed_stop() -> ModuleState {
+        ModuleState::Failed {
+            phase: FailurePhase::Stop,
+            error: "stop failed".into(),
+            at: 0,
+        }
+    }
+
+    #[test]
+    fn a_disabled_stopped_dependency_is_enabled_implicitly() {
+        let graph = chain();
+        let s = statuses(&[("t.a", disabled(ModuleState::Stopped))]);
+        let plan = plan(&graph, &s, ChangeAction::Enable, &id("t.b")).unwrap();
+        assert!(plan.is_applicable());
+        assert_eq!(
+            plan.steps,
+            vec![
+                PlanStep::Enable(id("t.a")),
+                PlanStep::Start(id("t.a")),
+                PlanStep::Enable(id("t.b")),
+                PlanStep::Start(id("t.b")),
+            ]
+        );
+        assert_eq!(plan.affected, ids(&["t.a"]));
+    }
+
+    #[test]
+    fn a_disabled_failed_dependency_blocks_enable() {
+        let graph = chain();
+        let s = statuses(&[("t.a", disabled(failed_stop()))]);
+        let plan = plan(&graph, &s, ChangeAction::Enable, &id("t.b")).unwrap();
+        assert!(!plan.is_applicable());
+        assert_eq!(
+            plan.blockers,
+            vec![Blocker {
+                id: id("t.a"),
+                state: failed_stop()
+            }]
+        );
+        assert!(plan.steps.is_empty() && plan.affected.is_empty());
+        assert_eq!(
+            verify(plan.clone(), &Confirmation::default()),
+            Verification::NotApplicable(plan)
+        );
+    }
+
+    #[test]
+    fn a_disabled_blocked_dependency_blocks_enable() {
+        // Not produced by the manager (a blocked module is enabled), but the
+        // planner must not start it whatever the snapshot says.
+        let graph = chain();
+        let state = ModuleState::Blocked {
+            by: id("t.x"),
+            reason: BlockReason::DependencyFailed,
+        };
+        let s = statuses(&[("t.b", disabled(state.clone())), ("t.a", running())]);
+        let blocked = plan(&graph, &s, ChangeAction::Enable, &id("t.c")).unwrap();
+        assert!(!blocked.is_applicable());
+        assert_eq!(
+            blocked.blockers,
+            vec![Blocker {
+                id: id("t.b"),
+                state
+            }]
+        );
+        // Disabled and in transition: the same.
+        let s = statuses(&[("t.a", disabled(ModuleState::Stopping))]);
+        let stopping = plan(&graph, &s, ChangeAction::Enable, &id("t.b")).unwrap();
+        assert!(!stopping.is_applicable());
+    }
+
+    #[test]
+    fn enable_of_a_failed_target_does_not_bypass_recover() {
+        let graph = chain();
+        let s = statuses(&[("t.a", disabled(failed_stop()))]);
+        assert_eq!(
+            plan(&graph, &s, ChangeAction::Enable, &id("t.a")),
+            Err(ModuleError::ActionNotApplicable {
+                module: id("t.a"),
+                action: ChangeAction::Enable
+            })
+        );
+        // Explicit recover keeps its behaviour: enable and start, confirmed.
+        let recover = plan(&graph, &s, ChangeAction::Recover, &id("t.a")).unwrap();
+        assert!(recover.requires_confirmation);
+        assert_eq!(
+            recover.steps,
+            vec![PlanStep::Enable(id("t.a")), PlanStep::Start(id("t.a"))]
+        );
+    }
+
+    #[test]
+    fn recover_does_not_recover_a_failed_dependency_implicitly() {
+        let graph = chain();
+        let s = statuses(&[("t.a", disabled(failed_stop())), ("t.b", failed())]);
+        let plan = plan(&graph, &s, ChangeAction::Recover, &id("t.b")).unwrap();
+        assert!(!plan.is_applicable());
+        assert_eq!(plan.blockers[0].id, id("t.a"));
+        assert!(plan.steps.is_empty());
     }
 }

@@ -534,6 +534,80 @@ fn a_failed_stop_does_not_prevent_stopping_the_others() {
     });
 }
 
+/// A disabled module whose stop failed (`{ Some(false), Failed { Stop } }`)
+/// is never started by enabling a dependent: only a confirmed `recover`
+/// brings it back (ADR-012). Checks the calls, not only the statuses.
+#[test]
+fn enabling_a_dependent_does_not_restart_a_dependency_whose_stop_failed() {
+    run(async {
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
+        h.confirm(ChangeAction::Enable, "t.b").await;
+        h.probe("t.a").script(|script| script.stop = Behavior::Fail);
+        h.confirm(ChangeAction::Disable, "t.a").await;
+        let a = h.status("t.a");
+        assert_eq!(a.enabled, Some(false));
+        assert_eq!(kind(&a.state), "Failed(Stop)");
+        assert_eq!(
+            h.status("t.b"),
+            ModuleStatus::default(),
+            "disabled by the cascade"
+        );
+        h.changes();
+        let probe_a = Arc::clone(h.probe("t.a"));
+        let probe_b = Arc::clone(h.probe("t.b"));
+        let calls = |probe: &Probe| {
+            (
+                count(&probe.created),
+                count(&probe.initialized),
+                count(&probe.started),
+            )
+        };
+        let (a_before, b_before) = (calls(&probe_a), calls(&probe_b));
+        let batches = h.store.batches().len();
+
+        let plan = h
+            .manager
+            .plan(ChangeAction::Enable, &id("t.b"))
+            .expect("plan");
+        assert!(!plan.is_applicable());
+        assert_eq!(plan.blockers[0].id, id("t.a"));
+        let outcome = h
+            .apply(ChangeAction::Enable, "t.b", confirmed(&["t.a"]))
+            .await;
+        assert!(
+            matches!(outcome, Ok(ApplyOutcome::NotApplicable(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            h.apply(ChangeAction::Enable, "t.a", confirmed(&[])).await,
+            Err(ManagerError::Module(ModuleError::ActionNotApplicable {
+                module: id("t.a"),
+                action: ChangeAction::Enable
+            })),
+            "enable of the failed module itself does not bypass recover"
+        );
+        settle().await;
+        assert_eq!(
+            calls(&probe_a),
+            a_before,
+            "t.a: no new instance, initialize or start"
+        );
+        assert_eq!(calls(&probe_b), b_before, "t.b: not started either");
+        assert!(h.changes().is_empty());
+        assert_eq!(h.store.batches().len(), batches, "nothing saved");
+        assert_eq!(kind(&h.status("t.a").state), "Failed(Stop)");
+        assert_eq!(h.status("t.a").enabled, Some(false));
+
+        // Only a confirmed recover brings t.a back; then t.b can be enabled.
+        h.probe("t.a")
+            .script(|script| script.stop = Behavior::Succeed);
+        h.confirm(ChangeAction::Recover, "t.a").await;
+        assert_eq!(h.status("t.a").state, ModuleState::Running);
+        h.confirm(ChangeAction::Enable, "t.b").await;
+        assert_eq!(h.status("t.b").state, ModuleState::Running);
+    });
+}
+
 #[test]
 fn a_repeated_disable_changes_nothing_and_tasks_are_finished() {
     run(async {
