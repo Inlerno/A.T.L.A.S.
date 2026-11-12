@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-11-12 — Issue #10 (MM-5A): настройки, `enabled`, автозапуск, готовность, недоступная конфигурация
+
+Объём — текст #10 (только MM-5A; MM-5B — #21). Решения — ADR-015 (новый) и дополнение ADR-012. ADR-014 не менялся: правка его строки «Автозапуска модулей при старте пока нет — это #10» ожидает решения пользователя (ADR-015, «Последствия»). Новых зависимостей и features нет, `Cargo.toml` и `Cargo.lock` не менялись (`serde_json = "1"` уже объявлен).
+
+### Что сделано
+- `modules/config.rs` (новый): `ModuleConfig`, `StoreError`, трейт `ModuleConfigStore` (`load`, атомарный `save_batch`), `InMemoryConfigStore`; общие проверки настроек (глубина, объект, размер, ключи-секреты).
+- `modules/contract.rs`: `ModuleStatus.enabled: Option<bool>`, `ModuleState::ConfigUnavailable`, `FailurePhase::Settings`, `BlockReason::DependencyConfigUnavailable`, расширенный инвариант; методы фабрики `default_settings` / `validate_settings`; `ModuleError::InvalidSettings`.
+- `modules/plan.rs`: правила для неизвестного решения (`None`).
+- `modules/context.rs`: настройки экземпляра (`ModuleContext::settings()`).
+- `modules/manager.rs`: снимок `ModulesSnapshot` (`ready`, статусы, настройки, `restart_required`), `is_ready`, `NotReady`, `ManagerReady`; загрузка конфигурации и автозапуск; реакция на ошибку `load`; запись решений планов одним пакетом; `get_settings` / `update_settings`; изоляция методов фабрики; выход по сигналу раньше очереди, режим выхода во время подготовки, точки проверки в каскаде сбоя, `debug_assert` «в режиме выхода статусы меняет только `shutdown_all`». Исправления PR #20 (D1, D2, L1) сохранены.
+- `events/types.rs`: `SettingsChanged { id, restart_required }`, `ManagerReady`.
+- `lib.rs`: менеджер создаётся с `InMemoryConfigStore`.
+- Тесты: `modules/settings_tests.rs` (новый), общий harness и тестовое хранилище с отказами — в `modules/testing.rs`; тест MM-4 «при старте ни один модуль не запускается» заменён тестом автозапуска.
+- Документация: ADR-015, ADR-012, `ARCHITECTURE.md`, эта запись.
+
+### Проверки в облачном Linux
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (181 юнит-тест + 3 интеграционных), `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` — без ошибок и предупреждений; прогоны повторялись без сбоев.
+- Мутационная проверка — 17 мутаций, результат в описании PR.
+
+### Проверка на Windows
+**Не выполнена.** Сценарий `check-mm5a.ps1` публикуется комментарием в PR; проверка считается пройденной только после запуска пользователем.
+
 ## 2026-11-10 — Issue #9 (PR #20): исправления D1, D2, L1 до слияния
 
 Исправления обязательны до слияния PR #20 (решение пользователя 2026-11-10). Технический план согласован пользователем: `claude/PR20_FIX_PLAN.md`, редакция 3 (документ проекта Claude, не репозитория). Архитектурные контракты, публичный API, статусы, тексты, таблица сроков ADR-014 и семантика прерывания `initialize` / `start` не менялись. Новых зависимостей и features нет.
