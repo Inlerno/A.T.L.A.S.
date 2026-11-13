@@ -1,7 +1,8 @@
 //! What a module instance can use (issue #9, ADR-014).
 //!
-//! A context belongs to one instance. It gives the module a subscription to
-//! the event bus, a cancellation token and supervised background tasks. It
+//! A context belongs to one instance. It gives the module its settings (#10),
+//! a subscription to the event bus, a cancellation token and supervised
+//! background tasks. It
 //! gives no access to the module manager (a module waiting for the manager
 //! while the manager waits for the module would deadlock) and no way to
 //! publish events (#12).
@@ -12,6 +13,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::mpsc::WeakUnboundedSender;
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
@@ -52,6 +54,9 @@ struct Inner {
     module: ModuleId,
     /// Number of the instance, so that reports of an older instance are ignored.
     instance: u64,
+    /// Settings the instance was created with; they do not change while it
+    /// runs (#10).
+    settings: Arc<Value>,
     events: EventBus,
     /// Cancelled by the manager when the instance stops.
     token: CancellationToken,
@@ -68,6 +73,7 @@ impl ModuleContext {
     pub(super) fn new(
         module: ModuleId,
         instance: u64,
+        settings: Arc<Value>,
         events: EventBus,
         reports: WeakUnboundedSender<Command>,
     ) -> Self {
@@ -75,6 +81,7 @@ impl ModuleContext {
             inner: Arc::new(Inner {
                 module,
                 instance,
+                settings,
                 events,
                 token: CancellationToken::new(),
                 tracker: TaskTracker::new(),
@@ -87,6 +94,19 @@ impl ModuleContext {
     /// Identifier of the module this instance belongs to.
     pub fn id(&self) -> &ModuleId {
         &self.inner.module
+    }
+
+    /// Settings of this instance, already checked by the manager and the
+    /// module's factory. Available from `initialize` on and the same for the
+    /// whole life of the instance: new settings apply to the next instance,
+    /// after a confirmed `restart` (#10). The module deserializes them into
+    /// its own type.
+    pub fn settings(&self) -> &Value {
+        &self.inner.settings
+    }
+
+    pub(super) fn settings_arc(&self) -> &Arc<Value> {
+        &self.inner.settings
     }
 
     /// Subscribes to the central event bus. Modules only subscribe; publishing

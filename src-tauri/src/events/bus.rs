@@ -289,11 +289,11 @@ mod tests {
         AppEvent::Module(ModuleEvent::StatusChanged {
             id: id(module),
             previous: ModuleStatus {
-                enabled: true,
+                enabled: Some(true),
                 state: ModuleState::Stopped,
             },
             current: ModuleStatus {
-                enabled: true,
+                enabled: Some(true),
                 state: ModuleState::Running,
             },
         })
@@ -396,7 +396,7 @@ mod tests {
         let bus = EventBus::new(4);
         let mut subscriber = bus.subscribe();
         let failed = ModuleStatus {
-            enabled: true,
+            enabled: Some(true),
             state: ModuleState::Failed {
                 phase: FailurePhase::Run,
                 error: "the module stopped responding".into(),
@@ -406,7 +406,7 @@ mod tests {
         let event = AppEvent::Module(ModuleEvent::StatusChanged {
             id: id("t.a"),
             previous: ModuleStatus {
-                enabled: true,
+                enabled: Some(true),
                 state: ModuleState::Running,
             },
             current: failed.clone(),

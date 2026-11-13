@@ -6,11 +6,7 @@
 //! (decision 23) and against the previous status of the same module, and the
 //! snapshot against the published changes.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::io::{self, Write};
-use std::pin::pin;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -18,258 +14,23 @@ use tokio::time::Instant;
 
 use super::context::ModuleContext;
 use super::contract::{
-    FailurePhase, Health, ModuleError, ModuleFactory, ModuleFailure, ModuleId, ModuleState,
-    ModuleStatus,
+    FailurePhase, Health, ModuleError, ModuleFactory, ModuleFailure, ModuleState, ModuleStatus,
 };
 use super::graph::ModuleGraph;
 use super::manager::{
-    self, ApplyOutcome, ApplyReport, HEALTH_CHECK_TIMEOUT, INITIALIZE_TIMEOUT, ManagerError,
-    ModuleManagerHandle, SHUTDOWN_TIMEOUT, START_TIMEOUT, STOP_TIMEOUT, StopReport,
-    TASKS_STOP_TIMEOUT, text,
+    self, ApplyOutcome, HEALTH_CHECK_TIMEOUT, INITIALIZE_TIMEOUT, ManagerError, SHUTDOWN_TIMEOUT,
+    START_TIMEOUT, STOP_TIMEOUT, StopReport, TASKS_STOP_TIMEOUT, text,
 };
 use super::plan::{ChangeAction, Confirmation};
-use super::testing::{
-    Background, Behavior, DropBehavior, FakeFactory, HealthBehavior, Probe, TaskEnd,
-};
+use super::testing::*;
 use crate::app::{AppState, ExitStep};
-use crate::events::bus::{EventBus, Received, Subscriber};
+use crate::events::bus::{EventBus, Received};
 use crate::events::types::{AppEvent, ModuleEvent};
-
-fn run<F: Future>(test: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .expect("test runtime")
-        .block_on(test)
-}
-
-fn id(value: &str) -> ModuleId {
-    ModuleId::new(value).expect("valid module id")
-}
-
-fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
-    pin!(future).poll(&mut Context::from_waker(Waker::noop()))
-}
-
-/// Lets every task run and up to a minute of virtual time pass, which is
-/// longer than any single timeout of the manager.
-async fn settle() {
-    tokio::time::sleep(Duration::from_secs(60)).await;
-}
-
-/// Yields until `condition` holds; fails instead of hanging.
-async fn wait_until(mut condition: impl FnMut() -> bool) {
-    for _ in 0..1000 {
-        if condition() {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("condition not reached");
-}
-
-fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
-    Probe::count(counter)
-}
-
-fn confirmed(affected: &[&str]) -> Confirmation {
-    Confirmation {
-        confirmed: true,
-        acknowledged: affected.iter().map(|module| id(module)).collect(),
-    }
-}
-
-/// Short form of a state for assertions.
-fn kind(state: &ModuleState) -> String {
-    match state {
-        ModuleState::Stopped => "Stopped".into(),
-        ModuleState::Initializing => "Initializing".into(),
-        ModuleState::Starting => "Starting".into(),
-        ModuleState::Running => "Running".into(),
-        ModuleState::Stopping => "Stopping".into(),
-        ModuleState::Failed { phase, .. } => format!("Failed({phase:?})"),
-        ModuleState::Blocked { by, reason } => format!("Blocked({by}, {reason:?})"),
-    }
-}
-
-/// A status change as (module, enabled, short state).
-type Change = (String, bool, String);
-
-fn change(module: &str, enabled: bool, state: &str) -> Change {
-    (module.to_owned(), enabled, state.to_owned())
-}
-
-fn enable_cycle(module: &str) -> Vec<Change> {
-    vec![
-        change(module, true, "Stopped"),
-        change(module, true, "Initializing"),
-        change(module, true, "Starting"),
-        change(module, true, "Running"),
-    ]
-}
-
-fn start_cycle(module: &str) -> Vec<Change> {
-    enable_cycle(module).split_off(1)
-}
-
-fn stop_cycle(module: &str, enabled: bool) -> Vec<Change> {
-    vec![
-        change(module, enabled, "Stopping"),
-        change(module, enabled, "Stopped"),
-    ]
-}
-
-fn failed_error(status: &ModuleStatus) -> &str {
-    match &status.state {
-        ModuleState::Failed { error, .. } => error,
-        other => panic!("expected Failed, got {other:?}"),
-    }
-}
-
-struct Harness {
-    manager: ModuleManagerHandle,
-    bus: EventBus,
-    events: Subscriber,
-    probes: BTreeMap<String, Arc<Probe>>,
-    /// Last status of each module seen in the events.
-    seen: BTreeMap<ModuleId, ModuleStatus>,
-}
-
-/// Starts the manager for fake modules `(id, dependencies)` on the current
-/// runtime.
-fn harness(modules: &[(&str, &[&str])]) -> Harness {
-    let bus = EventBus::new(4096);
-    let events = bus.subscribe();
-    let mut catalog: Vec<Box<dyn ModuleFactory>> = Vec::new();
-    let mut probes = BTreeMap::new();
-    for (module, dependencies) in modules {
-        let (factory, probe) = FakeFactory::new(module, dependencies);
-        catalog.push(Box::new(factory));
-        probes.insert((*module).to_owned(), probe);
-    }
-    let (manager, actor) = manager::create(catalog, bus.clone());
-    tokio::spawn(actor);
-    let seen = manager.statuses();
-    Harness {
-        manager,
-        bus,
-        events,
-        probes,
-        seen,
-    }
-}
-
-impl Harness {
-    fn probe(&self, module: &str) -> &Arc<Probe> {
-        &self.probes[module]
-    }
-
-    fn status(&self, module: &str) -> ModuleStatus {
-        self.manager.statuses()[&id(module)].clone()
-    }
-
-    async fn apply(
-        &self,
-        action: ChangeAction,
-        target: &str,
-        confirmation: Confirmation,
-    ) -> Result<ApplyOutcome, ManagerError> {
-        self.manager.apply(action, id(target), confirmation).await
-    }
-
-    /// Applies `action`, confirming exactly the affected modules of the
-    /// current plan, and expects it to be applied.
-    async fn confirm(&self, action: ChangeAction, target: &str) -> ApplyReport {
-        let plan = self.manager.plan(action, &id(target)).expect("plan");
-        let confirmation = Confirmation {
-            confirmed: true,
-            acknowledged: plan.affected,
-        };
-        match self.manager.apply(action, id(target), confirmation).await {
-            Ok(ApplyOutcome::Applied(report)) => report,
-            other => panic!("{action} {target} not applied: {other:?}"),
-        }
-    }
-
-    /// Events published since the last call, after the consistency checks.
-    fn events(&mut self) -> Vec<ModuleEvent> {
-        let mut events = Vec::new();
-        while let Poll::Ready(received) = poll_once(self.events.recv()) {
-            let Received::Event(envelope) = received else {
-                panic!("unexpected {received:?}");
-            };
-            let AppEvent::Module(event) = envelope.event;
-            if let ModuleEvent::StatusChanged {
-                id,
-                previous,
-                current,
-            } = &event
-            {
-                assert!(
-                    current.is_consistent(),
-                    "inconsistent status of {id}: {current:?}"
-                );
-                assert_eq!(
-                    self.seen.get(id),
-                    Some(previous),
-                    "a change of {id} must continue from its previous status"
-                );
-                self.seen.insert(id.clone(), current.clone());
-            }
-            events.push(event);
-        }
-        let snapshot = self.manager.statuses();
-        assert!(snapshot.values().all(ModuleStatus::is_consistent));
-        assert_eq!(
-            snapshot, self.seen,
-            "the snapshot matches the published changes"
-        );
-        events
-    }
-
-    /// Status changes since the last call, in short form.
-    fn changes(&mut self) -> Vec<Change> {
-        self.events()
-            .into_iter()
-            .filter_map(|event| match event {
-                ModuleEvent::StatusChanged { id, current, .. } => {
-                    Some((id.to_string(), current.enabled, kind(&current.state)))
-                }
-                ModuleEvent::HealthChanged { .. } => None,
-            })
-            .collect()
-    }
-
-    /// Health results published since the last call.
-    fn health_events(&mut self) -> Vec<(String, Health)> {
-        self.events()
-            .into_iter()
-            .filter_map(|event| match event {
-                ModuleEvent::HealthChanged { id, health } => Some((id.to_string(), health)),
-                ModuleEvent::StatusChanged { .. } => None,
-            })
-            .collect()
-    }
-}
-
-#[test]
-fn no_module_starts_when_the_manager_starts() {
-    run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
-        settle().await;
-        assert!(h.changes().is_empty());
-        for module in ["t.a", "t.b"] {
-            assert_eq!(h.status(module), ModuleStatus::default());
-            assert_eq!(count(&h.probe(module).created), 0);
-        }
-    });
-}
 
 #[test]
 fn enable_goes_through_initializing_starting_running() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         let report = h.confirm(ChangeAction::Enable, "t.a").await;
         assert_eq!(report.started, [id("t.a")]);
         assert_eq!(h.changes(), enable_cycle("t.a"));
@@ -289,7 +50,7 @@ fn enable_goes_through_initializing_starting_running() {
 #[test]
 fn a_module_subscribes_to_the_bus_through_its_context() {
     run(async {
-        let h = harness(&[("t.a", &[])]);
+        let h = harness(&[("t.a", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         let mut subscriber = h
             .probe("t.a")
@@ -310,7 +71,7 @@ fn a_module_subscribes_to_the_bus_through_its_context() {
 #[test]
 fn every_start_creates_a_new_instance_and_old_ones_are_dropped() {
     run(async {
-        let h = harness(&[("t.a", &[])]);
+        let h = harness(&[("t.a", &[])]).await;
         let probe = Arc::clone(h.probe("t.a"));
         h.confirm(ChangeAction::Enable, "t.a").await;
         h.confirm(ChangeAction::Restart, "t.a").await;
@@ -344,7 +105,7 @@ fn initialize_and_start_failures_fail_the_module_with_the_phase() {
     ];
     for (phase, behavior, error) in cases {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
             h.confirm(ChangeAction::Enable, "t.b").await;
             h.probe("t.a").script(|script| match phase {
                 FailurePhase::Initialize => script.initialize = behavior,
@@ -368,7 +129,7 @@ fn initialize_and_start_failures_fail_the_module_with_the_phase() {
             assert_eq!(report.failed.len(), 1);
             assert_eq!(report.failed[0].error, error);
             let status = h.status("t.a");
-            assert!(status.enabled, "a failed module stays enabled");
+            assert_eq!(status.enabled, Some(true), "a failed module stays enabled");
             assert_eq!(kind(&status.state), format!("Failed({phase:?})"));
             assert_eq!(failed_error(&status), error);
 
@@ -396,61 +157,11 @@ fn initialize_and_start_failures_fail_the_module_with_the_phase() {
     }
 }
 
-thread_local! {
-    /// Log output of the current test thread while it captures logs.
-    static CAPTURED: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };
-}
-
-/// Writes to the log buffer of the current thread, if it captures logs.
-struct ThreadLog;
-
-impl Write for ThreadLog {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        CAPTURED.with_borrow(|buffer| {
-            if let Some(buffer) = buffer {
-                buffer.lock().expect("log buffer").extend_from_slice(bytes);
-            }
-        });
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Returns what the current thread logs while `test` runs.
-///
-/// One global subscriber serves the whole unit-test binary (no unit test sets
-/// another one). A thread-local subscriber (`set_default`) would miss events:
-/// `tracing` caches per call site, for the whole process, whether a
-/// subscriber is interested, and a test running in parallel on another thread
-/// can cache "not interested" for a call site of the manager.
-fn capture_logs(test: impl FnOnce()) -> String {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(|| ThreadLog)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("no other global subscriber in unit tests");
-    });
-    tracing::callsite::rebuild_interest_cache();
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    CAPTURED.set(Some(Arc::clone(&buffer)));
-    test();
-    CAPTURED.set(None);
-    let bytes = buffer.lock().expect("log buffer").clone();
-    String::from_utf8(bytes).expect("utf-8 log")
-}
-
 #[test]
 fn panic_details_go_to_the_log_not_to_the_status() {
     let logs = capture_logs(|| {
         run(async {
-            let h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            let h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
             h.probe("t.a")
                 .script(|script| script.start = Behavior::Panic);
             h.confirm(ChangeAction::Enable, "t.a").await;
@@ -482,7 +193,8 @@ fn a_failed_background_task_blocks_running_dependents_in_reverse_order() {
             ("t.b", &["t.a"]),
             ("t.c", &["t.b"]),
             ("t.d", &[]),
-        ]);
+        ])
+        .await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.confirm(ChangeAction::Enable, "t.d").await;
         h.changes();
@@ -516,7 +228,7 @@ fn a_failed_background_task_blocks_running_dependents_in_reverse_order() {
 #[test]
 fn nothing_restarts_on_its_own() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]).await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         assert!(h.probe("t.a").end_background(TaskEnd::Fail));
         settle().await;
@@ -564,7 +276,8 @@ fn recover_is_confirmed_even_alone_and_restarts_blocked_dependents_in_order() {
             ("t.b", &["t.a"]),
             ("t.c", &["t.b"]),
             ("t.x", &[]),
-        ]);
+        ])
+        .await;
 
         // A single module.
         h.confirm(ChangeAction::Enable, "t.x").await;
@@ -603,7 +316,7 @@ fn recover_is_confirmed_even_alone_and_restarts_blocked_dependents_in_order() {
 #[test]
 fn restart_stops_dependents_in_reverse_order_and_starts_them_again() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]).await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.changes();
         let report = h.confirm(ChangeAction::Restart, "t.a").await;
@@ -628,7 +341,7 @@ fn restart_stops_dependents_in_reverse_order_and_starts_them_again() {
 #[test]
 fn a_module_whose_stop_fails_during_restart_is_not_started_again() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]).await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.probe("t.b").script(|script| script.stop = Behavior::Fail);
         h.changes();
@@ -656,7 +369,7 @@ fn a_module_whose_stop_fails_during_restart_is_not_started_again() {
 #[test]
 fn a_stale_confirmation_changes_nothing() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
         h.confirm(ChangeAction::Enable, "t.b").await;
         h.changes();
         let outcome = h.apply(ChangeAction::Disable, "t.a", confirmed(&[])).await;
@@ -678,7 +391,8 @@ fn a_failure_in_the_middle_of_a_plan_blocks_the_rest_without_retries() {
             ("t.b", &[]),
             ("t.c", &["t.a", "t.b"]),
             ("t.d", &["t.c"]),
-        ]);
+        ])
+        .await;
         h.probe("t.b")
             .script(|script| script.start = Behavior::Fail);
         let report = h.confirm(ChangeAction::Enable, "t.d").await;
@@ -712,7 +426,7 @@ fn a_failure_in_the_middle_of_a_plan_blocks_the_rest_without_retries() {
 #[test]
 fn a_plan_with_a_failed_dependency_is_not_applicable() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         assert!(h.probe("t.a").end_background(TaskEnd::Fail));
         settle().await;
@@ -728,7 +442,7 @@ fn a_plan_with_a_failed_dependency_is_not_applicable() {
 #[test]
 fn enable_with_disabled_dependencies_needs_confirmation() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
         let outcome = h
             .apply(ChangeAction::Enable, "t.b", Confirmation::default())
             .await;
@@ -750,7 +464,8 @@ fn disable_with_dependents_stops_them_in_reverse_order_and_disables_them() {
             ("t.b", &["t.a"]),
             ("t.c", &["t.b"]),
             ("t.d", &[]),
-        ]);
+        ])
+        .await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.confirm(ChangeAction::Enable, "t.d").await;
         h.changes();
@@ -777,7 +492,8 @@ fn a_failed_stop_does_not_prevent_stopping_the_others() {
             ("t.b", &["t.a"]),
             ("t.c", &["t.a"]),
             ("t.e", &["t.a"]),
-        ]);
+        ])
+        .await;
         for module in ["t.b", "t.c", "t.e"] {
             h.confirm(ChangeAction::Enable, module).await;
         }
@@ -804,7 +520,7 @@ fn a_failed_stop_does_not_prevent_stopping_the_others() {
         );
         for module in ["t.a", "t.b", "t.c", "t.e"] {
             let status = h.status(module);
-            assert!(!status.enabled, "{module} is disabled");
+            assert_eq!(status.enabled, Some(false), "{module} is disabled");
             assert_eq!(
                 count(&h.probe(module).stopped),
                 1,
@@ -818,10 +534,84 @@ fn a_failed_stop_does_not_prevent_stopping_the_others() {
     });
 }
 
+/// A disabled module whose stop failed (`{ Some(false), Failed { Stop } }`)
+/// is never started by enabling a dependent: only a confirmed `recover`
+/// brings it back (ADR-012). Checks the calls, not only the statuses.
+#[test]
+fn enabling_a_dependent_does_not_restart_a_dependency_whose_stop_failed() {
+    run(async {
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
+        h.confirm(ChangeAction::Enable, "t.b").await;
+        h.probe("t.a").script(|script| script.stop = Behavior::Fail);
+        h.confirm(ChangeAction::Disable, "t.a").await;
+        let a = h.status("t.a");
+        assert_eq!(a.enabled, Some(false));
+        assert_eq!(kind(&a.state), "Failed(Stop)");
+        assert_eq!(
+            h.status("t.b"),
+            ModuleStatus::default(),
+            "disabled by the cascade"
+        );
+        h.changes();
+        let probe_a = Arc::clone(h.probe("t.a"));
+        let probe_b = Arc::clone(h.probe("t.b"));
+        let calls = |probe: &Probe| {
+            (
+                count(&probe.created),
+                count(&probe.initialized),
+                count(&probe.started),
+            )
+        };
+        let (a_before, b_before) = (calls(&probe_a), calls(&probe_b));
+        let batches = h.store.batches().len();
+
+        let plan = h
+            .manager
+            .plan(ChangeAction::Enable, &id("t.b"))
+            .expect("plan");
+        assert!(!plan.is_applicable());
+        assert_eq!(plan.blockers[0].id, id("t.a"));
+        let outcome = h
+            .apply(ChangeAction::Enable, "t.b", confirmed(&["t.a"]))
+            .await;
+        assert!(
+            matches!(outcome, Ok(ApplyOutcome::NotApplicable(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            h.apply(ChangeAction::Enable, "t.a", confirmed(&[])).await,
+            Err(ManagerError::Module(ModuleError::ActionNotApplicable {
+                module: id("t.a"),
+                action: ChangeAction::Enable
+            })),
+            "enable of the failed module itself does not bypass recover"
+        );
+        settle().await;
+        assert_eq!(
+            calls(&probe_a),
+            a_before,
+            "t.a: no new instance, initialize or start"
+        );
+        assert_eq!(calls(&probe_b), b_before, "t.b: not started either");
+        assert!(h.changes().is_empty());
+        assert_eq!(h.store.batches().len(), batches, "nothing saved");
+        assert_eq!(kind(&h.status("t.a").state), "Failed(Stop)");
+        assert_eq!(h.status("t.a").enabled, Some(false));
+
+        // Only a confirmed recover brings t.a back; then t.b can be enabled.
+        h.probe("t.a")
+            .script(|script| script.stop = Behavior::Succeed);
+        h.confirm(ChangeAction::Recover, "t.a").await;
+        assert_eq!(h.status("t.a").state, ModuleState::Running);
+        h.confirm(ChangeAction::Enable, "t.b").await;
+        assert_eq!(h.status("t.b").state, ModuleState::Running);
+    });
+}
+
 #[test]
 fn a_repeated_disable_changes_nothing_and_tasks_are_finished() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         let context = h.probe("t.a").context().expect("context");
         assert!(context.tasks_alive() > 0);
@@ -850,7 +640,7 @@ fn a_repeated_disable_changes_nothing_and_tasks_are_finished() {
 #[test]
 fn background_tasks_that_ignore_cancellation_are_aborted() {
     run(async {
-        let h = harness(&[("t.a", &[])]);
+        let h = harness(&[("t.a", &[])]).await;
         h.probe("t.a")
             .script(|script| script.background = Background::IgnoresCancellation);
         h.confirm(ChangeAction::Enable, "t.a").await;
@@ -859,7 +649,7 @@ fn background_tasks_that_ignore_cancellation_are_aborted() {
         assert_eq!(started.elapsed(), TASKS_STOP_TIMEOUT);
         assert_eq!(report.failed[0].error, text::TASKS_ABORTED);
         let status = h.status("t.a");
-        assert!(!status.enabled);
+        assert_eq!(status.enabled, Some(false));
         assert_eq!(kind(&status.state), "Failed(Stop)");
         settle().await;
         assert_eq!(count(&h.probe("t.a").background), 0, "aborted");
@@ -869,7 +659,7 @@ fn background_tasks_that_ignore_cancellation_are_aborted() {
 #[test]
 fn health_results_are_published_and_never_change_the_state() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         h.changes();
 
@@ -908,7 +698,7 @@ fn health_results_are_published_and_never_change_the_state() {
 #[test]
 fn a_health_check_without_answer_reports_unhealthy_and_keeps_the_instance() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         h.changes();
         let late = Duration::from_secs(20);
@@ -959,7 +749,7 @@ fn a_health_check_without_answer_reports_unhealthy_and_keeps_the_instance() {
 #[test]
 fn a_module_whose_health_check_never_answers_is_stopped_without_stop() {
     run(async {
-        let h = harness(&[("t.a", &[])]);
+        let h = harness(&[("t.a", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         h.probe("t.a")
             .script(|script| script.health = HealthBehavior::Hang);
@@ -975,7 +765,7 @@ fn a_module_whose_health_check_never_answers_is_stopped_without_stop() {
         );
         assert_eq!(report.failed[0].error, text::UNRESPONSIVE);
         let status = h.status("t.a");
-        assert!(!status.enabled);
+        assert_eq!(status.enabled, Some(false));
         assert_eq!(kind(&status.state), "Failed(Stop)");
         assert_eq!(
             count(&h.probe("t.a").stopped),
@@ -996,7 +786,7 @@ fn a_module_whose_health_check_never_answers_is_stopped_without_stop() {
 #[test]
 fn a_health_check_panic_fails_the_module_and_blocks_dependents() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
         h.confirm(ChangeAction::Enable, "t.b").await;
         h.changes();
         h.probe("t.a")
@@ -1023,7 +813,7 @@ fn a_health_check_panic_fails_the_module_and_blocks_dependents() {
 #[test]
 fn a_late_health_check_panic_fails_the_module_at_once() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
         h.confirm(ChangeAction::Enable, "t.b").await;
         let after = Duration::from_secs(20);
         h.probe("t.a")
@@ -1070,7 +860,7 @@ fn cycles(changes: &[Change]) -> Vec<(String, &'static str)> {
 #[test]
 fn concurrent_commands_are_handled_one_after_another() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
         let commands = [
             (ChangeAction::Enable, "t.a"),
             (ChangeAction::Enable, "t.b"),
@@ -1126,7 +916,7 @@ fn concurrent_commands_are_handled_one_after_another() {
 #[test]
 fn a_report_of_a_stopped_instance_is_ignored() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.probe("t.a")
             .script(|script| script.background = Background::FailsOnCancel);
         h.confirm(ChangeAction::Enable, "t.a").await;
@@ -1147,7 +937,7 @@ fn a_report_of_a_stopped_instance_is_ignored() {
 #[test]
 fn a_failure_report_waits_for_the_command_in_progress() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.a").await;
         h.probe("t.b")
             .script(|script| script.initialize = Behavior::Hang);
@@ -1179,7 +969,7 @@ fn a_failure_report_waits_for_the_command_in_progress() {
 #[test]
 fn shutdown_stops_modules_in_reverse_order_within_the_overall_timeout() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &[])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &[])]).await;
         h.confirm(ChangeAction::Enable, "t.b").await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.probe("t.b").script(|script| script.stop = Behavior::Hang);
@@ -1211,7 +1001,7 @@ fn at_the_exit_deadline_the_modules_left_are_terminated() {
     run(async {
         let modules: [(&str, &[&str]); 4] =
             [("t.w", &[]), ("t.x", &[]), ("t.y", &[]), ("t.z", &[])];
-        let mut h = harness(&modules);
+        let mut h = harness(&modules).await;
         for (module, _) in modules {
             h.confirm(ChangeAction::Enable, module).await;
         }
@@ -1274,7 +1064,7 @@ fn at_the_exit_deadline_the_modules_left_are_terminated() {
 #[test]
 fn exit_interrupts_an_initialize_in_progress() {
     run(async {
-        let h = harness(&[("t.a", &[])]);
+        let h = harness(&[("t.a", &[])]).await;
         h.probe("t.a")
             .script(|script| script.initialize = Behavior::Hang);
         let enabling = {
@@ -1305,7 +1095,7 @@ fn exit_interrupts_an_initialize_in_progress() {
 #[test]
 fn exit_skips_the_rest_of_a_plan_in_progress() {
     run(async {
-        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]);
+        let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &["t.b"])]).await;
         h.probe("t.a")
             .script(|script| script.initialize = Behavior::Hang);
         let enabling = {
@@ -1342,7 +1132,7 @@ fn exit_skips_the_rest_of_a_plan_in_progress() {
 fn exit_order_stops_modules_before_the_bus_closes_and_nothing_follows() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
             h.confirm(ChangeAction::Enable, "t.a").await;
             h.confirm(ChangeAction::Enable, "t.b").await;
             h.probe("t.b").script(|script| script.stop = Behavior::Hang);
@@ -1410,7 +1200,8 @@ fn the_status_invariant_holds_through_a_long_scenario() {
             ("t.b", &["t.a"]),
             ("t.c", &["t.b"]),
             ("t.d", &[]),
-        ]);
+        ])
+        .await;
         h.confirm(ChangeAction::Enable, "t.c").await;
         h.events();
         h.confirm(ChangeAction::Enable, "t.d").await;
@@ -1436,7 +1227,7 @@ fn the_status_invariant_holds_through_a_long_scenario() {
             .script(|script| script.stop = Behavior::Panic);
         h.manager.shutdown().await.expect("shutdown");
         h.events();
-        let statuses = h.manager.statuses();
+        let statuses = h.manager.statuses().expect("ready after the exit");
         assert!(statuses.values().all(ModuleStatus::is_consistent));
         assert_eq!(
             statuses[&id("t.c")],
@@ -1453,7 +1244,7 @@ fn the_status_invariant_holds_through_a_long_scenario() {
         assert!(matches!(
             statuses[&id("t.b")],
             ModuleStatus {
-                enabled: false,
+                enabled: Some(false),
                 state: ModuleState::Stopped
             }
         ));
@@ -1467,9 +1258,12 @@ fn an_invalid_catalog_is_logged_and_leaves_the_manager_without_modules() {
             let (first, _) = FakeFactory::new("t.a", &[]);
             let (second, _) = FakeFactory::new("t.a", &[]);
             let catalog: Vec<Box<dyn ModuleFactory>> = vec![Box::new(first), Box::new(second)];
-            let (manager, actor) = manager::create(catalog, EventBus::new(8));
+            let store = Box::new(TestStore::default());
+            let (manager, actor) = manager::create(catalog, store, EventBus::new(8));
             tokio::spawn(actor);
-            assert!(manager.statuses().is_empty());
+            settle().await;
+            assert!(manager.is_ready());
+            assert!(manager.statuses().expect("ready").is_empty());
             let outcome = manager
                 .apply(ChangeAction::Enable, id("t.a"), confirmed(&[]))
                 .await;
@@ -1519,7 +1313,7 @@ fn background_at_drop(probe: &Probe) -> Vec<usize> {
 #[test]
 fn the_instance_is_dropped_before_its_tasks_are_waited_for() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.probe("t.a")
             .script(|script| script.background = Background::IgnoresCancellation);
         h.confirm(ChangeAction::Enable, "t.a").await;
@@ -1540,23 +1334,12 @@ fn the_instance_is_dropped_before_its_tasks_are_waited_for() {
         );
         assert_eq!(count(&probe.stopped), 1, "stop ran before the drop");
         let status = h.status("t.a");
-        assert!(!status.enabled);
+        assert_eq!(status.enabled, Some(false));
         assert_eq!(kind(&status.state), "Failed(Stop)");
         assert_eq!(failed_error(&status), text::TASKS_ABORTED);
         settle().await;
         assert_eq!(count(&probe.background), 0, "then the task was aborted");
     });
-}
-
-/// The single log line containing `message`; fails with the whole log
-/// otherwise.
-fn log_line<'a>(logs: &'a str, message: &str) -> &'a str {
-    let mut lines = logs.lines().filter(|line| line.contains(message));
-    let line = lines
-        .next()
-        .unwrap_or_else(|| panic!("no `{message}` in the log:\n{logs}"));
-    assert!(lines.next().is_none(), "`{message}` logged twice:\n{logs}");
-    line
 }
 
 /// Waits, in real time, for something another thread (the blocking pool)
@@ -1580,7 +1363,7 @@ fn wait_for_thread(mut condition: impl FnMut() -> bool) {
 fn a_panicking_drop_after_stop_fails_the_stop_and_the_manager_keeps_working() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &[]), ("t.c", &[])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[]), ("t.c", &[])]).await;
             for module in ["t.a", "t.b", "t.c"] {
                 h.confirm(ChangeAction::Enable, module).await;
             }
@@ -1593,7 +1376,7 @@ fn a_panicking_drop_after_stop_fails_the_stop_and_the_manager_keeps_working() {
             assert_eq!(report.failed.len(), 1);
             assert_eq!(report.failed[0].error, text::PANICKED);
             let status = h.status("t.a");
-            assert!(!status.enabled, "disable keeps enabled = false");
+            assert_eq!(status.enabled, Some(false), "disable keeps enabled = false");
             assert_eq!(kind(&status.state), "Failed(Stop)");
             assert_eq!(failed_error(&status), text::PANICKED);
             assert_eq!(
@@ -1650,7 +1433,7 @@ fn a_panicking_drop_after_stop_fails_the_stop_and_the_manager_keeps_working() {
 fn a_panicking_drop_after_a_failed_initialize_keeps_the_root_cause() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
             h.probe("t.a").script(|script| {
                 script.initialize = Behavior::Fail;
                 script.drop = DropBehavior::Panic;
@@ -1693,7 +1476,7 @@ fn a_panicking_drop_after_a_failed_initialize_keeps_the_root_cause() {
 #[test]
 fn a_blocked_drop_after_a_failed_initialize_does_not_delay_the_failed_status() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         let probe = Arc::clone(h.probe("t.a"));
         probe.script(|script| {
             script.initialize = Behavior::Fail;
@@ -1745,7 +1528,7 @@ fn a_panicking_drop_of_a_terminated_module_does_not_stop_the_exit() {
     run(async {
         let modules: [(&str, &[&str]); 4] =
             [("t.w", &[]), ("t.x", &[]), ("t.y", &[]), ("t.z", &[])];
-        let mut h = harness(&modules);
+        let mut h = harness(&modules).await;
         for (module, _) in modules {
             h.confirm(ChangeAction::Enable, module).await;
         }
@@ -1794,7 +1577,7 @@ fn a_panicking_drop_of_a_terminated_module_does_not_stop_the_exit() {
 #[test]
 fn a_panicking_drop_of_an_aborted_call_does_not_affect_the_manager() {
     run(async {
-        let mut h = harness(&[("t.a", &[])]);
+        let mut h = harness(&[("t.a", &[])]).await;
         h.probe("t.a").script(|script| {
             script.initialize = Behavior::Hang;
             script.drop = DropBehavior::Panic;
@@ -1834,7 +1617,7 @@ fn a_drop_that_does_not_return_in_time_fails_the_stop_and_the_exit_goes_on() {
             .expect("test runtime")
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(60), async {
-                    let mut h = harness(&[("t.a", &[]), ("t.b", &[])]);
+                    let mut h = harness(&[("t.a", &[]), ("t.b", &[])]).await;
                     h.confirm(ChangeAction::Enable, "t.a").await;
                     h.confirm(ChangeAction::Enable, "t.b").await;
                     let probe = Arc::clone(h.probe("t.b"));
@@ -1879,18 +1662,6 @@ fn a_drop_that_does_not_return_in_time_fails_the_stop_and_the_exit_goes_on() {
     assert!(line.contains("WARN") && line.contains("t.b"), "{line}");
 }
 
-/// Like `wait_until`, for a condition that is reached only after an instance
-/// drop on the blocking pool (D1): between yields it gives the pool threads
-/// real time, which matters on a single core. Fails after ten seconds.
-async fn wait_until_with_pool(mut condition: impl FnMut() -> bool) {
-    let limit = std::time::Instant::now() + Duration::from_secs(10);
-    while !condition() {
-        assert!(std::time::Instant::now() < limit, "condition not reached");
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 /// Lets every ready task on this thread run a few times: enough for a
 /// background task to end and its supervisor to send the report.
 async fn run_ready_tasks() {
@@ -1907,7 +1678,7 @@ async fn run_ready_tasks() {
 fn a_queued_failure_report_is_not_handled_after_the_exit_request() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &[])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.c", &[])]).await;
             h.confirm(ChangeAction::Enable, "t.b").await;
             h.probe("t.c")
                 .script(|script| script.initialize = Behavior::Hang);
@@ -1966,7 +1737,7 @@ fn a_queued_failure_report_is_not_handled_after_the_exit_request() {
 fn a_report_of_a_stopped_instance_is_logged_by_its_level() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[])]);
+            let mut h = harness(&[("t.a", &[])]).await;
             h.probe("t.a")
                 .script(|script| script.background = Background::FailsOnCancel);
             h.confirm(ChangeAction::Enable, "t.a").await;
@@ -2022,7 +1793,13 @@ fn a_failure_that_cannot_be_reported_is_logged() {
             // The queue is closed: `send` fails.
             let (reports, queue) = tokio::sync::mpsc::unbounded_channel::<manager::Command>();
             drop(queue);
-            let context = ModuleContext::new(id("t.a"), 7, EventBus::new(16), reports.downgrade());
+            let context = ModuleContext::new(
+                id("t.a"),
+                7,
+                Arc::default(),
+                EventBus::new(16),
+                reports.downgrade(),
+            );
             context.spawn("closed queue", async {
                 Err(ModuleFailure::new("fake error after the exit"))
             });
@@ -2033,7 +1810,7 @@ fn a_failure_that_cannot_be_reported_is_logged() {
             let (reports, _queue) = tokio::sync::mpsc::unbounded_channel::<manager::Command>();
             let weak = reports.downgrade();
             drop(reports);
-            let context = ModuleContext::new(id("t.b"), 8, EventBus::new(16), weak);
+            let context = ModuleContext::new(id("t.b"), 8, Arc::default(), EventBus::new(16), weak);
             context.spawn("no manager", async {
                 panic!("fake panic after the exit in /secret/path/late.rs")
             });
@@ -2071,74 +1848,75 @@ fn a_failure_that_cannot_be_reported_is_logged() {
 /// those of `shutdown_all`.
 #[test]
 fn messages_arriving_during_shutdown_all_start_nothing() {
-    let logs =
-        capture_logs(|| {
-            run(async {
-                let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.h", &[])]);
-                h.confirm(ChangeAction::Enable, "t.b").await;
-                h.confirm(ChangeAction::Enable, "t.h").await;
-                // t.h: a health check that answers after 7 s, so it still holds
-                // the instance when the exit begins and ends during the stops.
-                h.probe("t.h").script(|script| {
-                    script.health = HealthBehavior::Late {
-                        after: Duration::from_secs(7),
-                        panic: false,
-                    };
-                });
-                assert_eq!(
-                    h.manager.check_health(id("t.h")).await,
-                    Ok(Health::Unhealthy(text::HEALTH_NO_ANSWER.to_owned()))
-                );
-                h.probe("t.b")
-                    .script(|script| script.stop = Behavior::Delay(Duration::from_secs(3)));
-                h.changes();
-
-                let exiting = {
-                    let manager = h.manager.clone();
-                    tokio::spawn(async move { manager.shutdown().await })
+    let logs = capture_logs(|| {
+        run(async {
+            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"]), ("t.h", &[])]).await;
+            h.confirm(ChangeAction::Enable, "t.b").await;
+            h.confirm(ChangeAction::Enable, "t.h").await;
+            // t.h: a health check that answers after 7 s, so it still holds
+            // the instance when the exit begins and ends during the stops.
+            h.probe("t.h").script(|script| {
+                script.health = HealthBehavior::Late {
+                    after: Duration::from_secs(7),
+                    panic: false,
                 };
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                assert!(h.probe("t.a").end_background(TaskEnd::Fail));
-                let disabling = {
-                    let manager = h.manager.clone();
-                    tokio::spawn(async move {
-                        manager
-                            .apply(ChangeAction::Disable, id("t.a"), confirmed(&["t.b"]))
-                            .await
-                    })
-                };
-                let checking = {
-                    let manager = h.manager.clone();
-                    tokio::spawn(async move { manager.check_health(id("t.a")).await })
-                };
-
-                let report = exiting.await.expect("exit task").expect("shutdown");
-                assert_eq!(disabling.await.expect("task"), Err(ManagerError::ShutDown));
-                assert_eq!(checking.await.expect("task"), Err(ManagerError::ShutDown));
-                assert!(report.failed.is_empty(), "{report:?}");
-                assert_eq!(report.stopped.len(), 3);
-                for module in ["t.a", "t.b", "t.h"] {
-                    assert_eq!(
-                        h.status(module),
-                        ModuleStatus {
-                            enabled: true,
-                            state: ModuleState::Stopped
-                        },
-                        "{module}"
-                    );
-                    assert_eq!(count(&h.probe(module).stopped), 1, "{module}: one stop");
-                }
-                let changes = h.changes();
-                assert_eq!(changes.len(), 6, "{changes:?}");
-                assert!(
-                    changes.iter().all(|(_, enabled, state)| *enabled
-                        && (state == "Stopping" || state == "Stopped")),
-                    "only the stops of shutdown_all: {changes:?}"
-                );
-                settle().await;
-                assert!(h.events().is_empty(), "nothing after the reply");
             });
+            assert_eq!(
+                h.manager.check_health(id("t.h")).await,
+                Ok(Health::Unhealthy(text::HEALTH_NO_ANSWER.to_owned()))
+            );
+            h.probe("t.b")
+                .script(|script| script.stop = Behavior::Delay(Duration::from_secs(3)));
+            h.changes();
+
+            let exiting = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move { manager.shutdown().await })
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(h.probe("t.a").end_background(TaskEnd::Fail));
+            let disabling = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .apply(ChangeAction::Disable, id("t.a"), confirmed(&["t.b"]))
+                        .await
+                })
+            };
+            let checking = {
+                let manager = h.manager.clone();
+                tokio::spawn(async move { manager.check_health(id("t.a")).await })
+            };
+
+            let report = exiting.await.expect("exit task").expect("shutdown");
+            assert_eq!(disabling.await.expect("task"), Err(ManagerError::ShutDown));
+            assert_eq!(checking.await.expect("task"), Err(ManagerError::ShutDown));
+            assert!(report.failed.is_empty(), "{report:?}");
+            assert_eq!(report.stopped.len(), 3);
+            for module in ["t.a", "t.b", "t.h"] {
+                assert_eq!(
+                    h.status(module),
+                    ModuleStatus {
+                        enabled: Some(true),
+                        state: ModuleState::Stopped
+                    },
+                    "{module}"
+                );
+                assert_eq!(count(&h.probe(module).stopped), 1, "{module}: one stop");
+            }
+            let changes = h.changes();
+            assert_eq!(changes.len(), 6, "{changes:?}");
+            assert!(
+                changes
+                    .iter()
+                    .all(|(_, enabled, state)| *enabled == Some(true)
+                        && (state == "Stopping" || state == "Stopped")),
+                "only the stops of shutdown_all: {changes:?}"
+            );
+            settle().await;
+            assert!(h.events().is_empty(), "nothing after the reply");
         });
+    });
     let line = log_line(&logs, "background task failed after the exit request");
     assert!(
         line.contains("WARN") && line.contains("module=t.a"),
@@ -2169,7 +1947,7 @@ impl std::task::Wake for LogOnWake {
 fn a_repeated_shutdown_is_released_after_the_end_is_logged() {
     let logs = capture_logs(|| {
         run(async {
-            let h = harness(&[("t.a", &[])]);
+            let h = harness(&[("t.a", &[])]).await;
             h.confirm(ChangeAction::Enable, "t.a").await;
             h.probe("t.a")
                 .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));
@@ -2228,7 +2006,7 @@ fn a_repeated_shutdown_is_released_after_the_end_is_logged() {
 fn a_request_that_finds_the_queue_closed_fails_after_the_end_is_logged() {
     let logs = capture_logs(|| {
         run(async {
-            let h = harness(&[("t.a", &[])]);
+            let h = harness(&[("t.a", &[])]).await;
             h.confirm(ChangeAction::Enable, "t.a").await;
             h.probe("t.a")
                 .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));
@@ -2290,7 +2068,7 @@ fn a_request_that_finds_the_queue_closed_fails_after_the_end_is_logged() {
 fn the_manager_logs_its_end_before_replying() {
     let logs = capture_logs(|| {
         run(async {
-            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]);
+            let mut h = harness(&[("t.a", &[]), ("t.b", &["t.a"])]).await;
             h.confirm(ChangeAction::Enable, "t.b").await;
             h.probe("t.b")
                 .script(|script| script.stop = Behavior::Delay(Duration::from_secs(2)));

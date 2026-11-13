@@ -1,4 +1,4 @@
-//! Module contract (issues #7 and #9): identifiers, descriptors, statuses,
+//! Module contract (issues #7, #9 and #10): identifiers, descriptors, statuses,
 //! errors, and the `Module` / `ModuleFactory` traits implemented by modules.
 //!
 //! Status changes are published through the central typed event bus (#8)
@@ -8,6 +8,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use serde_json::Value;
 use thiserror::Error;
 
 use super::context::ModuleContext;
@@ -74,12 +75,38 @@ pub trait Module: Send + Sync {
     fn health_check(&self) -> BoxFuture<'_, Health>;
 }
 
-/// Catalog entry: describes a module and creates its instances.
+/// Catalog entry: describes a module, checks its settings and creates its
+/// instances.
+///
+/// The settings methods belong to the factory, not to an instance: settings
+/// are checked also for a module that is disabled and has no instance (#10,
+/// ADR-015). All three methods must be pure and fast — no I/O, no blocking —
+/// because the manager calls them on its own task. A panic in any of them is
+/// caught and does not stop the manager.
 pub trait ModuleFactory: Send + Sync {
     fn descriptor(&self) -> &ModuleDescriptor;
 
     /// Creates a new instance. State of a previous instance is never reused.
+    /// The instance gets its settings through [`ModuleContext::settings`],
+    /// available from `initialize` on.
     fn create(&self) -> Box<dyn Module>;
+
+    /// Settings of a module that has no stored record yet. Must pass
+    /// [`ModuleFactory::validate_settings`]. Default: an empty object.
+    fn default_settings(&self) -> Value {
+        Value::Object(serde_json::Map::new())
+    }
+
+    /// The module's own check of a settings value, run after the common checks
+    /// (object root, size, depth, no secret-like keys). The message is shown
+    /// to the user and must not contain the value. Default: a module without
+    /// settings accepts only an empty object.
+    fn validate_settings(&self, settings: &Value) -> Result<(), ModuleFailure> {
+        match settings {
+            Value::Object(map) if map.is_empty() => Ok(()),
+            _ => Err(ModuleFailure::new("у модуля нет настроек")),
+        }
+    }
 }
 
 /// Result of a health check. Informational: it is shown to the user and never
@@ -175,15 +202,24 @@ pub enum FailurePhase {
     Run,
     Stop,
     HealthCheck,
+    /// The settings of an enabled module are invalid; no instance was created
+    /// (#10).
+    Settings,
 }
 
 /// Why a module that the user left enabled cannot run.
+// The variant names are part of the agreed contract (#10, ADR-015): every
+// reason is about a dependency.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
     /// A dependency failed while running (set by the lifecycle manager, #9).
     DependencyFailed,
     /// A dependency is disabled (possible when configuration is loaded, #10).
     DependencyDisabled,
+    /// The configuration of a dependency could not be read, so the user's
+    /// decision about it is unknown (#10).
+    DependencyConfigUnavailable,
 }
 
 /// Actual state of a module (what is happening now).
@@ -206,6 +242,16 @@ pub enum ModuleState {
         by: ModuleId,
         reason: BlockReason,
     },
+    /// The configuration record of the module could not be read at startup:
+    /// the user's decision is unknown, so the module does not start and
+    /// accepts no action. In MM-5A it stays so for the rest of the run; the
+    /// next run reads the record again (#10, ADR-015).
+    ConfigUnavailable {
+        /// User-safe message. Store details go to the log only.
+        error: String,
+        /// Unix time in milliseconds.
+        at: u64,
+    },
 }
 
 impl ModuleState {
@@ -223,7 +269,10 @@ impl ModuleState {
 /// `enabled`, and nothing leaves `Failed`/`Blocked` without a confirmed `recover`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleStatus {
-    pub enabled: bool,
+    /// The user's decision. `None` — unknown: the configuration is not loaded
+    /// yet (only before the manager is ready) or its record could not be read
+    /// (`ConfigUnavailable`).
+    pub enabled: Option<bool>,
     pub state: ModuleState,
 }
 
@@ -231,18 +280,29 @@ impl Default for ModuleStatus {
     /// Disabled and stopped: the status of a module unknown to a snapshot.
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: Some(false),
             state: ModuleState::Stopped,
         }
     }
 }
 
 impl ModuleStatus {
-    /// Status consistency invariant (decision 23 in #13): a module that is
-    /// initializing, starting, running, stopping or blocked is enabled.
+    /// Status consistency invariant (decision 23 in #13, extended in #10):
+    /// - a module that is initializing, starting, running, stopping or blocked
+    ///   is enabled (`Some(true)`);
+    /// - `ConfigUnavailable` goes with an unknown decision (`None`);
+    /// - an unknown decision goes only with `ConfigUnavailable`, or with
+    ///   `Stopped` before the configuration is loaded (the manager checks that
+    ///   this happens only before it is ready).
     pub fn is_consistent(&self) -> bool {
-        self.enabled
-            || !(self.state.is_active() || matches!(self.state, ModuleState::Blocked { .. }))
+        match (&self.state, self.enabled) {
+            (ModuleState::ConfigUnavailable { .. }, enabled) => enabled.is_none(),
+            (ModuleState::Stopped, None) => true,
+            (_, None) => false,
+            (state, Some(enabled)) => {
+                enabled || !(state.is_active() || matches!(state, ModuleState::Blocked { .. }))
+            }
+        }
     }
 }
 
@@ -277,6 +337,11 @@ pub enum ModuleError {
         module: ModuleId,
         action: ChangeAction,
     },
+
+    /// The settings were refused by the common checks or by the module's own
+    /// validator (#10). `reason` names the problem, never the value.
+    #[error("invalid settings of module `{module}`: {reason}")]
+    InvalidSettings { module: ModuleId, reason: String },
 }
 
 fn display_path(path: &[ModuleId]) -> String {
@@ -313,7 +378,7 @@ mod tests {
     #[test]
     fn default_status_is_disabled_and_stopped() {
         let status = ModuleStatus::default();
-        assert!(!status.enabled);
+        assert_eq!(status.enabled, Some(false));
         assert_eq!(status.state, ModuleState::Stopped);
     }
 
@@ -352,53 +417,81 @@ mod tests {
 
     #[test]
     fn status_consistency_invariant() {
-        let blocked = ModuleState::Blocked {
+        let status = |enabled, state: &ModuleState| ModuleStatus {
+            enabled,
+            state: state.clone(),
+        };
+        let blocked = |reason| ModuleState::Blocked {
             by: ModuleId::new("t.a").expect("valid"),
-            reason: BlockReason::DependencyFailed,
+            reason,
         };
         let failed = ModuleState::Failed {
-            phase: FailurePhase::Stop,
+            phase: FailurePhase::Settings,
             error: "x".into(),
             at: 0,
         };
+        let unavailable = ModuleState::ConfigUnavailable {
+            error: "x".into(),
+            at: 0,
+        };
+        // Active and blocked: only enabled.
         for state in [
             ModuleState::Initializing,
             ModuleState::Starting,
             ModuleState::Running,
             ModuleState::Stopping,
-            blocked,
+            blocked(BlockReason::DependencyFailed),
+            blocked(BlockReason::DependencyDisabled),
+            blocked(BlockReason::DependencyConfigUnavailable),
         ] {
-            assert!(
-                ModuleStatus {
-                    enabled: true,
-                    state: state.clone()
-                }
-                .is_consistent()
-            );
-            assert!(
-                !ModuleStatus {
-                    enabled: false,
-                    state
-                }
-                .is_consistent()
-            );
+            assert!(status(Some(true), &state).is_consistent(), "{state:?}");
+            assert!(!status(Some(false), &state).is_consistent(), "{state:?}");
+            assert!(!status(None, &state).is_consistent(), "{state:?}");
         }
-        for state in [ModuleState::Stopped, failed] {
-            assert!(
-                ModuleStatus {
-                    enabled: true,
-                    state: state.clone()
-                }
-                .is_consistent()
-            );
-            assert!(
-                ModuleStatus {
-                    enabled: false,
-                    state
-                }
-                .is_consistent()
-            );
+        // Stopped and failed: enabled or disabled.
+        for state in [ModuleState::Stopped, failed.clone()] {
+            assert!(status(Some(true), &state).is_consistent());
+            assert!(status(Some(false), &state).is_consistent());
         }
+        // Unknown decision: with `ConfigUnavailable`, or `Stopped` before
+        // loading; never with anything else.
+        assert!(status(None, &unavailable).is_consistent());
+        assert!(status(None, &ModuleState::Stopped).is_consistent());
+        assert!(!status(None, &failed).is_consistent());
+        // `ConfigUnavailable` only with an unknown decision.
+        assert!(!status(Some(true), &unavailable).is_consistent());
+        assert!(!status(Some(false), &unavailable).is_consistent());
+        assert!(!unavailable.is_active());
+    }
+
+    #[test]
+    fn default_settings_methods_accept_only_an_empty_object() {
+        struct Plain(ModuleDescriptor);
+        impl ModuleFactory for Plain {
+            fn descriptor(&self) -> &ModuleDescriptor {
+                &self.0
+            }
+            fn create(&self) -> Box<dyn Module> {
+                unreachable!("not created in this test")
+            }
+        }
+        let factory = Plain(ModuleDescriptor {
+            id: ModuleId::new("t.a").expect("valid"),
+            display_name: "a".into(),
+            description: String::new(),
+            version: "0".into(),
+            dependencies: Vec::new(),
+            default_enabled: false,
+        });
+        let defaults = factory.default_settings();
+        assert_eq!(defaults, serde_json::json!({}));
+        assert_eq!(factory.validate_settings(&defaults), Ok(()));
+        assert!(
+            factory
+                .validate_settings(&serde_json::json!({"x": 1}))
+                .is_err()
+        );
+        assert!(factory.validate_settings(&serde_json::json!([])).is_err());
     }
 
     #[test]
