@@ -111,6 +111,9 @@ pub trait ModuleFactory: Send + Sync {
 
 /// Result of a health check. Informational: it is shown to the user and never
 /// starts, stops or restarts anything.
+// Module-facing API (ADR-014): its first consumers are the demo modules of
+// #12; until then only tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     Healthy,

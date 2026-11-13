@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use super::config::{ModuleConfig, ModuleConfigStore, check_settings};
 use super::context::{ModuleContext, TaskFailure, panic_text};
 use super::contract::{
-    BlockReason, FailurePhase, Health, Module, ModuleError, ModuleFactory, ModuleFailure, ModuleId,
-    ModuleState, ModuleStatus,
+    BlockReason, FailurePhase, Health, Module, ModuleDescriptor, ModuleError, ModuleFactory,
+    ModuleFailure, ModuleId, ModuleState, ModuleStatus,
 };
 use super::graph::ModuleGraph;
 use super::plan::{
@@ -139,6 +139,20 @@ pub struct ModulesSnapshot {
     pub settings: BTreeMap<ModuleId, SettingsEntry>,
     /// Running modules whose instance was created with other settings.
     pub restart_required: BTreeSet<ModuleId>,
+    /// Last health result of each running instance; absent until the first
+    /// check and after the instance is gone (#11).
+    pub health: BTreeMap<ModuleId, Health>,
+}
+
+/// One module as readers see it: its description and the current view of it
+/// in the snapshot (#11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleView {
+    pub descriptor: ModuleDescriptor,
+    pub status: ModuleStatus,
+    /// Last health result of the running instance, if it was checked.
+    pub health: Option<Health>,
+    pub restart_required: bool,
 }
 
 /// Settings of one module, as `get_settings` returns them.
@@ -223,7 +237,9 @@ pub struct ModuleManagerHandle {
 impl ModuleManagerHandle {
     /// `true` once the configuration is loaded and the startup has finished:
     /// from then on the snapshot is reliable (ADR-015). It does not mean the
-    /// manager still accepts commands.
+    /// manager still accepts commands. Readers outside tests learn it from
+    /// `NotReady` (#11).
+    #[cfg(test)]
     pub fn is_ready(&self) -> bool {
         self.snapshot.borrow().ready
     }
@@ -239,6 +255,37 @@ impl ModuleManagerHandle {
         } else {
             Err(ManagerError::NotReady)
         }
+    }
+
+    /// Every module of the catalog, in start order, as the snapshot shows it.
+    /// `NotReady` until the manager is ready.
+    pub fn modules(&self) -> Result<Vec<ModuleView>, ManagerError> {
+        let snapshot = self.snapshot.borrow();
+        if !snapshot.ready {
+            return Err(ManagerError::NotReady);
+        }
+        let order = self.graph.start_order().iter();
+        Ok(order.filter_map(|id| self.view(&snapshot, id)).collect())
+    }
+
+    /// One module as the snapshot shows it. `NotReady` until the manager is
+    /// ready; `UnknownModule` for an id that is not in the catalog.
+    pub fn module(&self, id: &ModuleId) -> Result<ModuleView, ManagerError> {
+        let snapshot = self.snapshot.borrow();
+        if !snapshot.ready {
+            return Err(ManagerError::NotReady);
+        }
+        self.view(&snapshot, id)
+            .ok_or_else(|| ModuleError::UnknownModule(id.clone()).into())
+    }
+
+    fn view(&self, snapshot: &ModulesSnapshot, id: &ModuleId) -> Option<ModuleView> {
+        Some(ModuleView {
+            descriptor: self.graph.descriptor(id)?.clone(),
+            status: snapshot.statuses.get(id).cloned().unwrap_or_default(),
+            health: snapshot.health.get(id).cloned(),
+            restart_required: snapshot.restart_required.contains(id),
+        })
     }
 
     /// The plan to show the user before confirmation, computed from the
@@ -438,6 +485,9 @@ pub(super) enum Command {
         reply: oneshot::Sender<StopReport>,
     },
     /// From the supervisor of a background task (`ModuleContext::spawn`).
+    // Module-facing API (ADR-014): its first consumers are the demo modules of
+    // #12; until then only tests use it.
+    #[cfg_attr(not(test), allow(dead_code))]
     TaskFailed {
         id: ModuleId,
         instance: u64,
@@ -1676,6 +1726,8 @@ impl Actor {
             return;
         }
         self.health.insert(id.clone(), health.clone());
+        // The snapshot first, then the event (decision 26).
+        self.refresh(id);
         self.publish(ModuleEvent::HealthChanged {
             id: id.clone(),
             health,
@@ -1699,13 +1751,18 @@ impl Actor {
         self.set_status(id, ModuleStatus { enabled, state });
     }
 
-    /// Recomputes `restart_required` of `id` and copies its status, settings
-    /// and flag into the snapshot. Returns the flag.
+    /// Recomputes `restart_required` of `id` and copies its status, settings,
+    /// last health result and flag into the snapshot. Returns the flag.
     fn refresh(&mut self, id: &ModuleId) -> bool {
         let restart_required = self.restart_needed(id);
         let status = self.statuses.get(id).cloned();
         let settings = self.settings.get(id).cloned();
+        let health = self.health.get(id).cloned();
         self.snapshot.send_modify(|snapshot| {
+            match health {
+                Some(health) => snapshot.health.insert(id.clone(), health),
+                None => snapshot.health.remove(id),
+            };
             if let Some(status) = status {
                 snapshot.statuses.insert(id.clone(), status);
             }

@@ -102,7 +102,8 @@ impl InMemoryConfigStore {
         lock(&self.records).get(id).cloned()
     }
 
-    /// All records, for tests and diagnostics.
+    /// All records, for tests.
+    #[cfg(test)]
     pub fn records(&self) -> BTreeMap<ModuleId, ModuleConfig> {
         lock(&self.records).clone()
     }

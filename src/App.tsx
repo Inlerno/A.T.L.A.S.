@@ -1,42 +1,38 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
 import "./App.css";
+import { loadModulesWhenReady, toIpcError } from "./lib/ipc";
+import type { IpcError, Module } from "./types/modules";
 
+type View =
+  | { phase: "initializing" }
+  | { phase: "ready"; modules: Module[] }
+  | { phase: "error"; error: IpcError };
+
+// Minimal status line of the module manager (issue #11). The modules panel
+// arrives with #12.
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [view, setView] = useState<View>({ phase: "initializing" });
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  useEffect(() => {
+    let cancelled = false;
+    loadModulesWhenReady()
+      .then((modules) => {
+        if (!cancelled) setView({ phase: "ready", modules });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setView({ phase: "error", error: toIpcError(error) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        <img src={reactLogo} className="logo react" alt="React logo" />
-      </div>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      <h1>ATLAS</h1>
+      {view.phase === "initializing" && <p>Менеджер модулей: инициализация…</p>}
+      {view.phase === "ready" && <p>Менеджер модулей готов. Модулей: {view.modules.length}.</p>}
+      {view.phase === "error" && <p>Ошибка: {view.error.message}</p>}
     </main>
   );
 }

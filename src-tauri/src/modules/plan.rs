@@ -210,8 +210,9 @@ pub fn verify(current: ChangePlan, confirmation: &Confirmation) -> Verification 
 
 /// Statuses expected after all steps of `plan` succeed.
 ///
-/// Used to show the outcome before confirmation and in tests. A step that fails
-/// at runtime yields `Failed`/`Blocked` instead (#9).
+/// Used by tests to check plans. A step that fails at runtime yields
+/// `Failed`/`Blocked` instead (#9).
+#[cfg(test)]
 pub fn expected_statuses(plan: &ChangePlan, statuses: &StatusMap) -> StatusMap {
     let mut result = statuses.clone();
     for step in &plan.steps {
