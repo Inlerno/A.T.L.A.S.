@@ -3,12 +3,9 @@ pub mod logging;
 
 mod app;
 mod clock;
-// TODO(#11): remove these temporary allowances once IPC commands consume the
-// module manager and the event bus. Until then parts of the MM-2..MM-4 code
-// have no consumers outside tests (agreed plan, decision 22 in #13).
-#[cfg_attr(not(test), allow(dead_code))]
+mod commands;
+mod dto;
 mod events;
-#[cfg_attr(not(test), allow(dead_code))]
 mod modules;
 
 use tauri::Manager;
@@ -16,12 +13,7 @@ use tauri::Manager;
 use crate::app::{AppState, ExitStep};
 use crate::error::AppError;
 use crate::events::bus::{DEFAULT_CAPACITY, EventBus};
-
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+use crate::events::ui_bridge::{self, WebviewSink};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -41,6 +33,10 @@ pub fn run() {
             logging::install_panic_hook();
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "ATLAS starting");
             let events = EventBus::new(DEFAULT_CAPACITY);
+            // The bridge subscribes before the manager runs, so the UI is
+            // sent every event from the first one (#11).
+            let bridge = ui_bridge::run(events.subscribe(), WebviewSink(app.handle().clone()));
+            tauri::async_runtime::spawn(bridge);
             // The manager loads the module configuration and starts the
             // enabled modules on its own task (#10, ADR-015). The store keeps
             // the configuration in memory for this run; persistence between
@@ -52,7 +48,15 @@ pub fn run() {
             app.manage(AppState::new(log_guard, events, modules));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            commands::modules::list_modules,
+            commands::modules::get_module,
+            commands::modules::plan_module_change,
+            commands::modules::apply_module_change,
+            commands::modules::check_module_health,
+            commands::modules::get_module_settings,
+            commands::modules::update_module_settings,
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

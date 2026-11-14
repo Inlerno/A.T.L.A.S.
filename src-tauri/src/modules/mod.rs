@@ -22,7 +22,7 @@ mod manager_tests;
 #[cfg(test)]
 mod settings_tests;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use contract::ModuleFactory;
 
