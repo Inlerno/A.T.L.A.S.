@@ -92,3 +92,13 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --locked
+
+      # Demo modules (#12) exist only with the feature `demo-modules`: the
+      # normal build above has none of their code, so it is checked separately.
+      - name: cargo clippy (demo-modules)
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets --features demo-modules -- -D warnings
+
+      - name: cargo test (demo-modules)
+        working-directory: src-tauri
+        run: cargo test --locked --features demo-modules

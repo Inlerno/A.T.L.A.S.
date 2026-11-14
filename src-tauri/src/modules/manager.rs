@@ -485,9 +485,9 @@ pub(super) enum Command {
         reply: oneshot::Sender<StopReport>,
     },
     /// From the supervisor of a background task (`ModuleContext::spawn`).
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     TaskFailed {
         id: ModuleId,
         instance: u64,

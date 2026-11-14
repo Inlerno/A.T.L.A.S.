@@ -35,6 +35,11 @@ tokio = { version = "1.54.1", features = ["sync", "rt", "time"] }
 # Module manager (issue #9): CancellationToken and TaskTracker (feature `rt`). Already in the lock file.
 tokio-util = { version = "0.7.20", features = ["rt"] }
 
+[features]
+# Demo modules for manual checks of the module manager (issue #12). Not part
+# of a normal build.
+demo-modules = []
+
 [dev-dependencies]
 # Unit tests run futures on a current-thread runtime; test-util = paused time for timeout tests.
 # No `macros`: no new crate (decision 27 in #13).

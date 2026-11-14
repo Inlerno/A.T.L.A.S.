@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-11-14 — Issue #12 (MM-7): панель модулей, диалог подтверждения, демо-модули
+
+Объём — текст #12. Новых зависимостей нет: `Cargo.lock`, `package.json`, `package-lock.json` и `capabilities/default.json` не менялись; в `Cargo.toml` добавлена только секция `[features]` с `demo-modules = []`. ADR не менялись: публикация модулями и `EventSource::Module` предусмотрены ADR-013 для #12.
+
+### Что сделано
+- Фронтенд, `src/features/modules/` (новый): `ModulesPanel.tsx`, `ConfirmChangeDialog.tsx`, `SettingsEditor.tsx`, `useModules.ts` (состояние по событиям и `resync`, без опроса), `labels.ts`, `modules.css`. `App.tsx` и `App.css` — панель вместо строки состояния; шаблонные `public/vite.svg`, `public/tauri.svg` и ссылка на favicon удалены.
+- `modules/demo.rs` (новый, только с feature `demo-modules`): `demo.base` ← `demo.service` ← `demo.client`; настройки `fail_on_start`, `panic_after_secs`, `tick_interval_secs`.
+- `events/types.rs`, `events/bus.rs`, `modules/context.rs` (всё — только с feature): `AppEvent::Demo(DemoEvent::Tick { n })`, `EventSource::Module(id)`, `PublishError`, `ModuleContext::publish`. Источник ставит ядро; событие жизненного цикла от модуля отклоняется.
+- `modules/mod.rs`: `catalog()` с feature возвращает демо-модули, без неё — пуст.
+- `dto/modules.rs`: демо-события в UI не пересылаются; уточнён комментарий о `seq` (пропуск номера — не признак потери событий; о потере сообщает `modules://resync`). То же — в `src/types/modules.ts`. Других изменений MM-6 нет.
+- CI: дополнительно `cargo clippy` и `cargo test` с `--features demo-modules`.
+- Документация: `README.md` (запуск с демо-модулями), `ARCHITECTURE.md`, эта запись.
+
+### Отступления от текста #12
+- Тестов фронтенда нет: в проекте нет тестовой среды для него, а добавлять зависимости в этом этапе не согласовано. Поведение панели проверяется ручными сценариями; правила, от которых оно зависит (планы, подтверждения, настройки), покрыты тестами Rust.
+- В обычной сборке на API для модулей остаются точечные `allow(dead_code)`: его единственные потребители — демо-модули, которых в обычной сборке нет. С feature `demo-modules` и в тестах эти разрешения не действуют (кроме вариантов `Health::Degraded` / `Unhealthy`: демо-модули сообщают только `Healthy`).
+
+### Проверки в облачном Linux
+- Обычная сборка: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (206 юнит-тестов + 3 интеграционных), `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked`, `npm run build` — без ошибок и предупреждений.
+- С `--features demo-modules`: `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (215 юнит-тестов + 3 интеграционных), `cargo doc` — без ошибок и предупреждений. 9 новых тестов (`modules::demo::tests`): порядок запуска и остановки цепочки, `Tick` с источником `demo.service` в шине и в журнале клиента, сбой по `panic_after_secs` с безопасным текстом и блокировкой клиента, отсутствие каких-либо событий и перезапусков за 2 минуты после сбоя, `recover`, `fail_on_start`, проверка настроек, «нужен перезапуск», отказ модулю в публикации события жизненного цикла, остановка при выходе в обратном порядке.
+- Запуск под Xvfb сборки со встроенным фронтендом (`--features demo-modules,tauri/custom-protocol`), действия мышью и клавиатурой через `xdotool`, результат — по снимкам экрана и журналу: три DEMO-модуля; включение `demo.client` — диалог с `demo.base` и `demo.service`, после подтверждения все три «Работает»; «Проверить» — «исправен»; неверные настройки и некорректный JSON — понятные ошибки; новые настройки — «нужен перезапуск», модуль не перезапущен; перезапуск сервиса — диалог с `demo.client`; сбой по `panic_after_secs` — сервис «Сбой», клиент «Заблокирован», `demo.base` работает; `recover` клиента — объяснение с `demo.service`; `recover` сервиса — диалог; отключение `demo.base` — диалог, «Отмена» ничего не меняет; в журнале — `demo tick received … source=demo.service`; закрытие окна — остановка модулей, код выхода 0. Сборка без feature под Xvfb показывает «Модули не зарегистрированы».
+
+### Проверка на Windows
+**Не выполнена.** Сценарий и чек-лист ручных проверок — в PR. Результат вносит пользователь.
+
 ## 2026-11-13 — Issue #11 (MM-6): IPC и мост событий
 
 Объём — текст #11. Новых зависимостей нет; `Cargo.toml`, `Cargo.lock`, `package.json` и `capabilities/default.json` не менялись.

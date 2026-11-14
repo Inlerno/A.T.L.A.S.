@@ -31,13 +31,31 @@ npm ci
 npm run tauri dev
 ```
 
-Проверки:
+В обычной сборке модулей пока нет: окно показывает панель модулей с текстом «Модули не зарегистрированы».
+
+### Демо-модули
+Для ручной проверки менеджера модулей есть три демо-модуля — `demo.base` ← `demo.service` ← `demo.client`. Они собираются только с feature `demo-modules`; в обычной сборке и в установщике их нет.
+
+```powershell
+npm run tauri dev -- --features demo-modules
+```
+
+Все три изначально отключены. Настройки (кнопка «Настройки», JSON) вызывают сбои по требованию:
+- `fail_on_start: true` — модуль не запускается;
+- `panic_after_secs: N` — фоновая задача модуля аварийно завершается через N секунд после запуска (`null` — никогда);
+- `tick_interval_secs: N` (только `demo.service`) — период события `Tick`; `demo.client` пишет каждое полученное событие в журнал.
+
+Настройки и решения «включён / отключён» пока хранятся только в памяти и теряются при закрытии приложения (постоянное хранение — отдельный этап).
+
+### Проверки
 ```powershell
 npm run build
 cd src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy --all-targets --features demo-modules -- -D warnings
+cargo test --features demo-modules
 ```
 
 Держите репозиторий в коротком ASCII-пути вне OneDrive.

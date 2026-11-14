@@ -424,16 +424,18 @@ impl ModuleSettingsDto {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiEventDto {
-    /// Publication number: strictly increasing; a gap means missed events.
+    /// Publication number on the bus: strictly increasing, but not by one —
+    /// the bus also carries events that are not sent to the UI. Missed events
+    /// are reported by `modules://resync`, not by a gap.
     pub seq: u64,
     pub at_unix_ms: u64,
     pub event: ModuleEventDto,
 }
 
 impl UiEventDto {
-    /// `None` for an event the UI is not meant to see. Today every module
-    /// event is forwarded; the exhaustive match makes a new variant an
-    /// explicit decision.
+    /// `None` for an event the UI is not meant to see. Every lifecycle event
+    /// is forwarded; the exhaustive match makes a new variant an explicit
+    /// decision.
     pub fn from_envelope(envelope: EventEnvelope) -> Option<Self> {
         let event = match envelope.event {
             AppEvent::Module(ModuleEvent::StatusChanged {
@@ -459,6 +461,9 @@ impl UiEventDto {
                 restart_required,
             },
             AppEvent::Module(ModuleEvent::ManagerReady) => ModuleEventDto::ManagerReady,
+            // Demo events stay inside the core: the UI has no use for them.
+            #[cfg(feature = "demo-modules")]
+            AppEvent::Demo(_) => return None,
         };
         Some(Self {
             seq: envelope.seq,

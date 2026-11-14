@@ -120,7 +120,11 @@ export type ModuleEvent =
   | { type: "settingsChanged"; id: ModuleId; restartRequired: boolean }
   | { type: "managerReady" };
 
-/** Payload of `modules://event`. A gap in `seq` means missed events. */
+/**
+ * Payload of `modules://event`. `seq` grows, but not by one: the bus also
+ * carries events that are not sent to the UI. Missed events are reported by
+ * `modules://resync`, not by a gap.
+ */
 export interface UiEvent {
   seq: number;
   atUnixMs: number;

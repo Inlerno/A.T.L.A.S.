@@ -25,9 +25,9 @@ use super::manager::Command;
 use crate::events::bus::{EventBus, Subscriber};
 
 /// How a supervised background task ended badly.
-// Module-facing API (ADR-014): its first consumers are the demo modules of
-// #12; until then only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
+// Module-facing API (ADR-014). Its only consumers so far are the demo
+// modules (#12, feature `demo-modules`): a normal build has no modules yet.
+#[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
 #[derive(Debug)]
 pub(super) enum TaskFailure {
     /// The task returned an error; its message is safe to show.
@@ -60,9 +60,9 @@ struct Inner {
     /// Settings the instance was created with; they do not change while it
     /// runs (#10).
     settings: Arc<Value>,
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     events: EventBus,
     /// Cancelled by the manager when the instance stops.
     token: CancellationToken,
@@ -72,9 +72,9 @@ struct Inner {
     tasks: Mutex<Option<Vec<AbortHandle>>>,
     /// Failure reports go to the manager as commands. Weak: a context does not
     /// keep the manager alive.
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     reports: WeakUnboundedSender<Command>,
 }
 
@@ -110,9 +110,9 @@ impl ModuleContext {
     /// whole life of the instance: new settings apply to the next instance,
     /// after a confirmed `restart` (#10). The module deserializes them into
     /// its own type.
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     pub fn settings(&self) -> &Value {
         &self.inner.settings
     }
@@ -121,20 +121,33 @@ impl ModuleContext {
         &self.inner.settings
     }
 
-    /// Subscribes to the central event bus. Modules only subscribe; publishing
-    /// by modules arrives in #12.
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Publishes an event on the central bus on behalf of this module: the
+    /// bus stamps this module as the source, and lifecycle events are refused
+    /// (#12). Behind the demo feature until the first real domain event
+    /// exists; then it becomes the general API.
+    #[cfg(feature = "demo-modules")]
+    pub fn publish(
+        &self,
+        event: crate::events::types::AppEvent,
+    ) -> Result<u64, crate::events::bus::PublishError> {
+        self.inner
+            .events
+            .publish_from_module(&self.inner.module, event)
+    }
+
+    /// Subscribes to the central event bus.
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     pub fn subscribe(&self) -> Subscriber {
         self.inner.events.subscribe()
     }
 
     /// Token cancelled when the instance is being stopped. Background tasks
     /// watch it and finish promptly.
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.token.child_token()
     }
@@ -148,9 +161,9 @@ impl ModuleContext {
     /// instance stops, the manager waits for its tasks for a limited time and
     /// then aborts the rest. A task started after the stop has begun is not
     /// run. Must be called within the tokio runtime, as all module code is.
-    // Module-facing API (ADR-014): its first consumers are the demo modules of
-    // #12; until then only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Module-facing API (ADR-014). Its only consumers so far are the demo
+    // modules (#12, feature `demo-modules`): a normal build has no modules yet.
+    #[cfg_attr(not(any(test, feature = "demo-modules")), allow(dead_code))]
     pub fn spawn<F>(&self, name: &'static str, task: F)
     where
         F: Future<Output = Result<(), ModuleFailure>> + Send + 'static,
