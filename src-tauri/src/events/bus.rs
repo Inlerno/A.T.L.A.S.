@@ -66,6 +66,17 @@ pub enum Received {
 #[error("the event bus is closed")]
 pub struct BusClosed;
 
+/// Why the bus refused an event of a module (#12).
+#[cfg(feature = "demo-modules")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PublishError {
+    #[error("the event bus is closed")]
+    Closed,
+    /// Lifecycle events (`AppEvent::Module`) are published only by the core.
+    #[error("a module cannot publish lifecycle events")]
+    NotAllowed,
+}
+
 /// Handle to the central bus. Clones share one channel and one `seq` counter.
 #[derive(Debug, Clone)]
 pub struct EventBus {
@@ -117,6 +128,33 @@ impl EventBus {
     ///
     /// [`BusClosed`] after [`close`](Self::close); no `seq` is used then.
     pub fn publish(&self, event: AppEvent) -> Result<u64, BusClosed> {
+        self.send(EventSource::Core, event)
+    }
+
+    /// Publishes an event of a module. The bus stamps the module as the
+    /// source, so a module cannot publish on behalf of the core or of another
+    /// module; lifecycle events are refused, because only the core publishes
+    /// them (#12). Called only by `ModuleContext::publish` with the id of the
+    /// context's own module.
+    ///
+    /// # Errors
+    ///
+    /// [`PublishError::NotAllowed`] for a lifecycle event (no `seq` is used),
+    /// [`PublishError::Closed`] after [`close`](Self::close).
+    #[cfg(feature = "demo-modules")]
+    pub(crate) fn publish_from_module(
+        &self,
+        module: &crate::modules::contract::ModuleId,
+        event: AppEvent,
+    ) -> Result<u64, PublishError> {
+        if matches!(event, AppEvent::Module(_)) {
+            return Err(PublishError::NotAllowed);
+        }
+        self.send(EventSource::Module(module.clone()), event)
+            .map_err(|BusClosed| PublishError::Closed)
+    }
+
+    fn send(&self, source: EventSource, event: AppEvent) -> Result<u64, BusClosed> {
         let mut shared = self.lock();
         let Shared { sender, last_seq } = &mut *shared;
         let sender = sender.as_ref().ok_or(BusClosed)?;
@@ -124,7 +162,7 @@ impl EventBus {
         let envelope = EventEnvelope {
             seq: *last_seq,
             at_unix_ms: unix_time_ms(),
-            source: EventSource::Core,
+            source,
             event,
         };
         // The event has its `seq` but is not sent yet: tests stop a publisher

@@ -785,7 +785,11 @@ impl Harness {
             let Received::Event(envelope) = received else {
                 panic!("unexpected {received:?}");
             };
-            let AppEvent::Module(event) = envelope.event;
+            // The harness has no module that publishes anything else.
+            #[cfg_attr(not(feature = "demo-modules"), allow(irrefutable_let_patterns))]
+            let AppEvent::Module(event) = envelope.event else {
+                panic!("unexpected {:?}", envelope.event);
+            };
             if event == ModuleEvent::ManagerReady {
                 assert!(
                     self.manager.is_ready(),

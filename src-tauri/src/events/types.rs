@@ -4,8 +4,8 @@
 //! so subscribers match exhaustively and never receive an untyped payload.
 //! A variant is added together with the code that publishes it (decision 5 in
 //! #13): `HealthChanged` with the lifecycle manager (#9), `SettingsChanged`
-//! and `ManagerReady` with settings (#10), the demo event with #12. Events are notifications
-//! only and never carry secrets.
+//! and `ManagerReady` with settings (#10), the demo event with the demo
+//! modules (#12). Events are notifications only and never carry secrets.
 
 use crate::modules::contract::{Health, ModuleId, ModuleStatus};
 
@@ -24,20 +24,45 @@ pub struct EventEnvelope {
     pub event: AppEvent,
 }
 
-/// Publisher of an event.
-///
-/// `Module(ModuleId)` is added in #12 together with publication by modules;
-/// the core will stamp it, so a module cannot publish on behalf of another.
+/// Publisher of an event, stamped by the bus: a module cannot publish on
+/// behalf of the core or of another module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventSource {
     /// The application core, e.g. the lifecycle manager (#9).
     Core,
+    /// A module, through its own context (#12). Until the first real domain
+    /// event exists, only demo modules publish.
+    #[cfg(feature = "demo-modules")]
+    Module(ModuleId),
+}
+
+#[cfg(feature = "demo-modules")]
+impl std::fmt::Display for EventSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core => f.write_str("core"),
+            Self::Module(id) => write!(f, "{id}"),
+        }
+    }
 }
 
 /// Every application event, grouped by domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppEvent {
+    /// Lifecycle of modules. Published only by the core.
     Module(ModuleEvent),
+    /// Events of the demo modules (#12, feature `demo-modules`).
+    #[cfg(feature = "demo-modules")]
+    Demo(DemoEvent),
+}
+
+/// Events exchanged by the demo modules to check the central bus (#12).
+#[cfg(feature = "demo-modules")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DemoEvent {
+    /// Published by `demo.service` at its tick interval; `n` counts from 1
+    /// for each instance.
+    Tick { n: u64 },
 }
 
 /// Events of the module domain.
